@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: test, build, package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: bash
+            platform: linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - shell: pwsh
+            platform: windows
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          target: ${{ matrix.target }}
+
+      - name: Verify x86_64 runner (linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          [ "$arch" = "x86_64" ] || { echo "unexpected runner architecture: $arch"; exit 1; }
+
+      - name: Verify x86_64 runner (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+            Write-Error "unexpected runner architecture: $($env:PROCESSOR_ARCHITECTURE)"
+            exit 1
+          }
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg libasound2-dev libgtk-3-dev pkg-config cmake
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Install Windows build dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Error 'choco install ffmpeg failed'; exit 1 }
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'ffmpeg not on PATH or failed to run'; exit 1 }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'ffprobe not on PATH or failed to run'; exit 1 }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'cmake not on PATH or failed to run'; exit 1 }
+
+      - name: Resolve package version
+        id: version
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          try:
+              proc = subprocess.run(
+                  [
+                      "cargo",
+                      "metadata",
+                      "--locked",
+                      "--no-deps",
+                      "--format-version",
+                      "1",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+          except (OSError, subprocess.CalledProcessError) as exc:
+              sys.stderr.write(f"cargo metadata failed: {exc}\n")
+              sys.exit(1)
+
+          try:
+              meta = json.loads(proc.stdout)
+          except json.JSONDecodeError as exc:
+              sys.stderr.write(f"invalid JSON from cargo metadata: {exc}\n")
+              sys.exit(1)
+
+          packages = meta.get("packages") or []
+          target_manifest = os.path.abspath(os.path.join(os.getcwd(), "Cargo.toml"))
+          root_id = (meta.get("resolve") or {}).get("root")
+
+          pkg = None
+          if root_id is not None:
+              for candidate in packages:
+                  if candidate.get("id") == root_id:
+                      pkg = candidate
+                      break
+          if pkg is None:
+              for candidate in packages:
+                  manifest = candidate.get("manifest_path") or ""
+                  if os.path.abspath(manifest) == target_manifest:
+                      pkg = candidate
+                      break
+          if pkg is None:
+              sys.stderr.write("root package not found in cargo metadata\n")
+              sys.exit(1)
+
+          version = str(pkg.get("version") or "").strip()
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              sys.stderr.write(f"invalid Cargo package version: {version}\n")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release binaries
+        run: cargo build --release --bins --locked
+
+      - name: Smoke the CLI (linux)
+        if: matrix.platform == 'linux'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/release/kvr"
+          "$bin" --help
+          out="$("$bin" --version)"
+          if [ "$out" != "kvr $VERSION" ]; then
+            echo "kvr --version did not report the expected exact string: got '$out', expected 'kvr $VERSION'"
+            exit 1
+          fi
+          echo "$out"
+
+      - name: Smoke the CLI (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $bin = Join-Path 'target/release' 'kvr.exe'
+          if (-not (Test-Path -LiteralPath $bin)) { Write-Error "missing $bin"; exit 1 }
+          & $bin --help
+          if ($LASTEXITCODE -ne 0) { Write-Error 'kvr --help failed'; exit 1 }
+          $out = (& $bin --version) -join ' '
+          if ($LASTEXITCODE -ne 0) { Write-Error 'kvr --version failed'; exit 1 }
+          if ($out -ne ("kvr " + $env:VERSION)) {
+            Write-Error ("kvr --version did not report the expected exact string: got '" + $out + "', expected 'kvr " + $env:VERSION + "'")
+            exit 1
+          }
+          Write-Host $out
+
+      - name: Package release archive (linux)
+        if: matrix.platform == 'linux'
+        env:
+          RELEASE_VERSION: "v${{ steps.version.outputs.version }}"
+        run: |
+          set -euo pipefail
+          bash scripts/package-release.sh "$RELEASE_VERSION" --bin-dir target/release --output-dir dist
+
+      - name: Package release archive (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: "v${{ steps.version.outputs.version }}"
+        run: |
+          pwsh -NoProfile -File scripts/package-release.ps1 "$env:RELEASE_VERSION" -BinDir 'target/release' -OutputDir 'dist'
+
+      - name: Verify checksum (linux)
+        if: matrix.platform == 'linux'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sidecar="dist/kvr-v${VERSION}-linux-x86_64.tar.gz.sha256"
+          [ -f "$sidecar" ] || { echo "missing checksum sidecar: $sidecar"; exit 1; }
+          (cd dist && sha256sum -c --quiet "kvr-v${VERSION}-linux-x86_64.tar.gz.sha256")
+
+      - name: Verify checksum (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $sidecar = Join-Path 'dist' "kvr-v${env:VERSION}-windows-x86_64.zip.sha256"
+          if (-not (Test-Path -LiteralPath $sidecar)) {
+            Write-Error "missing checksum sidecar: $sidecar"
+            exit 1
+          }
+          $archive = $sidecar -replace '\.sha256$', ''
+          $parts = ([System.IO.File]::ReadAllText($sidecar).Trim() -split '\s+')
+          if ($parts.Count -ne 2 -or $parts[1] -ne [System.IO.Path]::GetFileName($archive)) {
+            Write-Error "unexpected checksum sidecar: $sidecar"
+            exit 1
+          }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($parts[0] -ne $actual) {
+            Write-Error "checksum mismatch for $([System.IO.Path]::GetFileName($archive))"
+            exit 1
+          }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvr-v${{ steps.version.outputs.version }}-${{ matrix.platform }}-x86_64
+          path: dist
+          if-no-files-found: error

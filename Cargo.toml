@@ -1,0 +1,60 @@
+[package]
+name = "kagantic-voice-recorder"
+version = "0.1.0"
+edition = "2021"
+description = "Native audio recorder that captures microphone input and writes Opus / WAV / raw PCM."
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "kvr_recorder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvr"
+path = "src/main.rs"
+
+[[bin]]
+name = "kvr-gui"
+path = "src/bin/gui.rs"
+
+[dependencies]
+cpal = "0.15"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "sync", "io-util", "io-std", "time", "fs"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "5.0"
+ctrlc = "3.4"
+bitflags = "2.6"
+libc = "0.2"
+
+# Opus encoder (bundles libopus via the opusic-c bindings; no system dep).
+opus = { package = "opusic-c", version = "1.6" }
+
+# GUI deps — used only by the kvr-gui binary.
+egui = { version = "0.33", default-features = false }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wayland", "x11", "glow"] }
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# CPAL's Linux backend already uses this version. Use its safe metadata API
+# to keep friendly labels separate from the exact ALSA capture identifiers.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+[target.'cfg(target_os = "windows")'.dependencies]
+# Native process liveness for `is_pid_alive` (OpenProcess/GetExitCodeProcess).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
