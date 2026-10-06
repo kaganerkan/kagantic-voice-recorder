@@ -124,4 +124,9 @@ ffmpeg -i recording.opus -f wav out.wav
 
   They enforce the version match, the single-root archive layout, the
   binary smoke test, and checksum verification, and never overwrite an
-  existing archive.
+  existing archive. Windows packaging additionally rejects Visual C++ runtime
+  DLL imports in both binaries, using Visual Studio's `dumpbin` on Windows or
+  binutils' `objdump` on Linux. Keep `.cargo/config.toml` and
+  `.cargo/msvc-runtime.cmake` enabled: Rust and bundled libopus must both use
+  the static MSVC runtime. Runner smoke tests alone cannot detect this
+  regression because the runner already has the redistributable installed.

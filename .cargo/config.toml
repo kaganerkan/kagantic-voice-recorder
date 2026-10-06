@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# opusic-sys builds libopus with CMake; its own runtime option defaults to /MD.
+"CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc" = { value = ".cargo/msvc-runtime.cmake", relative = true }

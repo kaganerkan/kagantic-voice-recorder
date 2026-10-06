@@ -4,6 +4,8 @@
 
 # Test / backup output
 **/*.rs.bk
+*.log
+*.exe
 
 # Editor / OS junk
 *.swp

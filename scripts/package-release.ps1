@@ -32,9 +32,10 @@
 # The version (with or without a leading "v") must equal the Cargo package
 # version. Binaries are validated as PE x86-64 before packaging, and on a
 # native Windows host the CLI is smoke-tested (kvr --version must
-# report exactly `kvr <VERSION>`). The script never succeeds with
-# missing or mismatched inputs and never overwrites an existing archive
-# or sidecar.
+# report exactly `kvr <VERSION>`). Both binaries must be free of dynamically
+# linked Visual C++ runtime DLLs (checked with dumpbin on Windows, objdump on Linux).
+# The script never succeeds with missing or mismatched inputs and never
+# overwrites an existing archive or sidecar.
 
 [CmdletBinding()]
 param(
@@ -158,10 +159,45 @@ function Test-PeX64 {
     finally { $stream.Dispose() }
 }
 
+# Build runners have the redistributable installed, so executing there alone
+# cannot detect a release that would fail on a clean Windows machine.
+if ($hostWindows) {
+    $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+    if ($dumpbin) {
+        $dependencyTool = $dumpbin.Source
+    }
+    else {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+        if (-not (Test-Path -LiteralPath $vswhere)) { throw 'dumpbin not on PATH and vswhere not found' }
+        $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($LASTEXITCODE -ne 0 -or -not $vsRoot) { throw 'Visual Studio C++ tools not found' }
+        $tools = Get-ChildItem -Path (Join-Path $vsRoot 'VC/Tools/MSVC') -Directory |
+            Sort-Object { [version]$_.Name } -Descending
+        $dependencyTool = Join-Path $tools[0].FullName 'bin/Hostx64/x64/dumpbin.exe'
+        if (-not (Test-Path -LiteralPath $dependencyTool)) { throw "dumpbin not found: $dependencyTool" }
+    }
+}
+else {
+    $objdump = Get-Command objdump -ErrorAction SilentlyContinue
+    if (-not $objdump) { throw 'objdump is required to inspect Windows runtime dependencies on Linux' }
+    $dependencyTool = $objdump.Source
+}
+
 foreach ($bin in @('kvr', 'kvr-gui')) {
     $src = Join-Path $BinDirAbs ($bin + $exe)
     if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "missing release binary: $src" }
     if (-not (Test-PeX64 $src)) { throw "$src is not a Windows x86-64 PE executable" }
+    if ($hostWindows) {
+        $dependencies = & $dependencyTool /nologo /dependents $src 2>&1
+    }
+    else {
+        $dependencies = & $dependencyTool -p $src 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) { throw "dependency inspection failed for ${src}: $($dependencies -join ' ')" }
+    $runtimeDlls = [regex]::Matches(($dependencies -join "`n"), '(?i)\b(?:vcruntime\d+[^ \t\r\n]*|msvcp\d+[^ \t\r\n]*|concrt\d+[^ \t\r\n]*|msvcr\d+[^ \t\r\n]*|ucrtbase[d]?)\.dll\b')
+    if ($runtimeDlls.Count -gt 0) {
+        throw "$src requires Visual C++ runtime DLLs: $($runtimeDlls.Value -join ', '). Rebuild with the repository's static CRT configuration."
+    }
 }
 
 # Smoke the CLI on a native Windows host: --help and --version must

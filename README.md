@@ -32,7 +32,7 @@
 | Platform | Release archive | Runtime notes |
 |---|---|---|
 | **Linux x86_64** (glibc 2.35+, e.g. Ubuntu 22.04+) | `kvr-v0.1.0-linux-x86_64.tar.gz` (`kvr`, `kvr-gui`) | ALSA capture; GTK 3 (native save dialog); OpenGL for the GUI renderer |
-| **Windows x86_64** (MSVC) | `kvr-v0.1.0-windows-x86_64.zip` (`kvr.exe`, `kvr-gui.exe`) | WASAPI capture; if a `vcruntime`/`msvcp` DLL is reported missing, install the current [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) |
+| **Windows x86_64** (MSVC) | `kvr-v0.1.0-windows-x86_64.zip` (`kvr.exe`, `kvr-gui.exe`) | WASAPI capture; MSVC runtime statically linked, no separate Visual C++ Redistributable required |
 | **macOS** | not a release target | CoreAudio support exists in `cpal`; macOS builds are not verified by this project's CI |
 
 ## Quick start
@@ -209,6 +209,16 @@ Windows).
 - **Windows:** Visual Studio Build Tools with *Desktop development with C++*
   (MSVC + Windows SDK) and [CMake](https://cmake.org/) on `PATH`.
 
+The repository's [Cargo configuration](.cargo/config.toml) enables `crt-static`
+for Windows MSVC builds. Its target-specific CMake toolchain also enables
+`OPUS_STATIC_RUNTIME` for bundled libopus; both are necessary to avoid
+`VCRUNTIME140.dll` dependencies. Build from the repository root and do not
+override these settings with `RUSTFLAGS` or a different CMake toolchain.
+Existing Windows executables must be rebuilt to pick up this change.
+For an older release reporting a missing runtime DLL, installing Microsoft's
+[Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
+is a workaround; do not download individual DLLs from third-party sites.
+
 `ffmpeg`/`ffprobe` are needed for the integration tests (see [CONTRIBUTING.md](CONTRIBUTING.md))
 and for verifying recordings; the app itself does not need them.
 
@@ -319,8 +329,11 @@ The Windows release archive is built on the `windows-2022` GitHub-hosted
 runner with the MSVC + Windows SDK toolchain (Visual Studio Build Tools,
 "Desktop development with C++") plus CMake. `scripts/package-release.ps1`
 refuses to overwrite an existing archive, requires every binary to be a
-real PE x86-64 file, validates the single-root directory structure of the
-ZIP, and writes a SHA-256 sidecar. The Windows CLI is smoke-tested
+real PE x86-64 file, rejects Visual C++ runtime DLL imports in either executable,
+validates the single-root directory structure of the ZIP, and writes a SHA-256
+sidecar. Dependency inspection uses `dumpbin` from Visual Studio Build Tools
+on Windows, or `objdump` (binutils) when cross-packaging on Linux.
+The Windows CLI is smoke-tested
 (`--help` / `--version`) only on the `windows-2022` runner, where it must
 report exactly `kvr <version>` before the archive is uploaded. Linux
 runners cannot execute Windows PE binaries, so the per-platform CLI smoke
