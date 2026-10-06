@@ -121,8 +121,8 @@ ffmpeg -i recording.opus -f wav out.wav
 - Packaging scripts have a fixed interface:
 
   ```bash
-  bash scripts/package-release.sh v0.1.0 --bin-dir target/release --output-dir dist
-  pwsh scripts/package-release.ps1 v0.1.0 -BinDir target/release -OutputDir dist
+  bash scripts/package-release.sh v0.1.1 --bin-dir target/release --output-dir dist
+  pwsh scripts/package-release.ps1 v0.1.1 -BinDir target/release -OutputDir dist
   ```
 
   They enforce the version match, the single-root archive layout, the

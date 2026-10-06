@@ -25,9 +25,9 @@
 # Usage (relative paths are resolved against the repository root):
 #
 #   Windows host:
-#     pwsh scripts/package-release.ps1 v0.1.0 -BinDir target\release -OutputDir dist
+#     pwsh scripts/package-release.ps1 v0.1.1 -BinDir target\release -OutputDir dist
 #   Linux host (real cross-built PE binaries):
-#     pwsh scripts/package-release.ps1 v0.1.0 -Platform windows -BinDir target/x86_64-pc-windows-msvc/release -OutputDir dist
+#     pwsh scripts/package-release.ps1 v0.1.1 -Platform windows -BinDir target/x86_64-pc-windows-msvc/release -OutputDir dist
 #
 # The version (with or without a leading "v") must equal the Cargo package
 # version. Binaries are validated as PE x86-64 before packaging, and on a
@@ -40,7 +40,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true,
-               HelpMessage = 'Release version with an optional "v" prefix (e.g. v0.1.0). Must equal the Cargo package version.')]
+               HelpMessage = 'Release version with an optional "v" prefix (e.g. v0.1.1). Must equal the Cargo package version.')]
     [string]$TagOrVersion,
 
     [Parameter(HelpMessage = 'Directory containing the release binaries (default: target/release).')]

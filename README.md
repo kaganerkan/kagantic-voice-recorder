@@ -31,8 +31,8 @@
 
 | Platform | Release archive | Runtime notes |
 |---|---|---|
-| **Linux x86_64** (glibc 2.35+, e.g. Ubuntu 22.04+) | `kvr-v0.1.0-linux-x86_64.tar.gz` (`kvr`, `kvr-gui`) | ALSA capture; GTK 3 (native save dialog); OpenGL for the GUI renderer |
-| **Windows x86_64** (MSVC) | `kvr-v0.1.0-windows-x86_64.zip` (`kvr.exe`, `kvr-gui.exe`) | WASAPI capture; MSVC runtime statically linked, no separate Visual C++ Redistributable required |
+| **Linux x86_64** (glibc 2.35+, e.g. Ubuntu 22.04+) | `kvr-v0.1.1-linux-x86_64.tar.gz` (`kvr`, `kvr-gui`) | ALSA capture; GTK 3 (native save dialog); OpenGL for the GUI renderer |
+| **Windows x86_64** (MSVC) | `kvr-v0.1.1-windows-x86_64.zip` (`kvr.exe`, `kvr-gui.exe`) | WASAPI capture; MSVC runtime statically linked, no separate Visual C++ Redistributable required |
 | **macOS** | not a release target | CoreAudio support exists in `cpal`; macOS builds are not verified by this project's CI |
 
 ## Quick start
@@ -226,11 +226,11 @@ and for verifying recordings; the app itself does not need them.
 
 Releases are produced by [`.github/workflows/release.yml`](.github/workflows/release.yml);
 checks run on every push and PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-No release has been published yet — the table above shows the exact archive
-names for the first release, `v0.1.0`.
+The table above shows the exact archive names for the current package version,
+`v0.1.1`.
 
 Each archive has a single root directory
-(`kvr-v0.1.0-linux-x86_64` / `kvr-v0.1.0-windows-x86_64`)
+(`kvr-v0.1.1-linux-x86_64` / `kvr-v0.1.1-windows-x86_64`)
 containing the two binaries plus `README.md`, `LICENSE`,
 `THIRD_PARTY_NOTICES.md`, the three font `*-OFL.txt` notices, and
 `assets/pixel-art-logo.png` so the packaged README logo resolves — not the
@@ -240,12 +240,12 @@ Checksums are published alongside: a `<archive>.sha256` sidecar for each archive
 
 ```bash
 # Linux
-sha256sum -c kvr-v0.1.0-linux-x86_64.tar.gz.sha256
+sha256sum -c kvr-v0.1.1-linux-x86_64.tar.gz.sha256
 ```
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\kvr-v0.1.0-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\kvr-v0.1.1-windows-x86_64.zip -Algorithm SHA256
 # compare against the value in the .sha256 sidecar / SHA256SUMS
 ```
 
@@ -254,8 +254,8 @@ Packaging is done by `scripts/package-release.sh` (Linux) and
 against `Cargo.toml`, the archive layout, and checksum verification:
 
 ```bash
-bash scripts/package-release.sh v0.1.0 --bin-dir target/release --output-dir dist
-pwsh scripts/package-release.ps1 v0.1.0 -BinDir target/release -OutputDir dist
+bash scripts/package-release.sh v0.1.1 --bin-dir target/release --output-dir dist
+pwsh scripts/package-release.ps1 v0.1.1 -BinDir target/release -OutputDir dist
 ```
 
 **Automatic releases from `main`.** Pushing to `main` publishes the Cargo package
@@ -284,7 +284,7 @@ artifact-only, even when selecting a tag.
 3. Watch the Release workflow. After both platform jobs pass, it creates the
    matching version tag and GitHub release automatically; no manual tag push
    is needed. The first unpublished version is also eligible, including the
-   current `0.1.0`.
+   current `0.1.1`.
 
 If a platform job fails, no tag or release is created. Fix the failure and push
 again, or rerun the failed workflow. If publication fails after tag creation,
@@ -339,12 +339,12 @@ remains platform-local.
 To verify the archive on a Windows machine:
 
 ```powershell
-Expand-Archive .\kvr-v0.1.0-windows-x86_64.zip
-.\kvr-v0.1.0-windows-x86_64\kvr.exe --version
-Get-FileHash .\kvr-v0.1.0-windows-x86_64.zip -Algorithm SHA256
+Expand-Archive .\kvr-v0.1.1-windows-x86_64.zip
+.\kvr-v0.1.1-windows-x86_64\kvr.exe --version
+Get-FileHash .\kvr-v0.1.1-windows-x86_64.zip -Algorithm SHA256
 ```
 
-The expected `kvr --version` output is `kvr 0.1.0` and the hash
+The expected `kvr --version` output is `kvr 0.1.1` and the hash
 must match the value in the sidecar / `SHA256SUMS`.
 
 </details>
