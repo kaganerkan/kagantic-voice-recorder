@@ -102,15 +102,18 @@ ffmpeg -i recording.opus -f wav out.wav
 
 - `.github/workflows/ci.yml` — `rustfmt` check, `clippy`, tests, and a
   release build on both native platforms, on every push and pull request.
-- `.github/workflows/release.yml` — releases from pushed version tags and
-  manual (artifact-only) builds:
-  - A release is created only when a version tag matching the Cargo
-    package version (currently `v0.1.0`) is **pushed**; the version is
-    read from Cargo metadata, not the tag string. The scripts accept a
-    stable `X.Y.Z` version.
-  - The publish job runs only when the triggering event is that tag push
-    and after **both** the Linux and Windows test/build/package jobs are
-    green; it creates the release and uploads the archives and checksums.
+- `.github/workflows/release.yml` — automatic versioned releases from `main`,
+  pushed version tags, and manual (artifact-only) builds:
+  - A push to `main` publishes the Cargo version if its GitHub release does
+    not exist. Already-published versions skip the release jobs.
+  - Versions come from Cargo metadata and must be stable `X.Y.Z` values.
+    Pushed tags must match `vX.Y.Z`.
+  - After **both** platform test/build/package jobs pass, publication creates
+    the version tag at the tested commit if absent, then uploads the release
+    archives and checksums. An existing tag pointing elsewhere is rejected.
+  - Publication is serialized per version and never overwrites release assets.
+    If publication fails after creating the tag, rerun that workflow commit;
+    bump the version before publishing different code.
   - Manual dispatch builds the artifacts only — it never creates a
     release, even if a tag is selected in the dispatch UI.
   - Build/test/package jobs get read-only repository access; only the

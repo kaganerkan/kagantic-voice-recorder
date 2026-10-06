@@ -3,6 +3,8 @@ name: Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -18,6 +20,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,12 +31,16 @@ jobs:
       - name: Resolve and validate version
         id: version
         shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           import json
           import os
           import re
           import subprocess
           import sys
+          import urllib.error
+          import urllib.request
 
           try:
               proc = subprocess.run(
@@ -85,22 +92,44 @@ jobs:
               sys.exit(1)
 
           event = os.environ.get("GITHUB_EVENT_NAME", "")
-          if event == "push":
-              ref = os.environ.get("GITHUB_REF", "")
-              tag = ref[len("refs/tags/"):] if ref.startswith("refs/tags/") else ref
+          ref = os.environ.get("GITHUB_REF", "")
+          publish = event == "push" and (ref == "refs/heads/main" or ref.startswith("refs/tags/"))
+          if event == "push" and ref.startswith("refs/tags/"):
+              tag = ref[len("refs/tags/"):]
               if tag != f"v{version}":
                   sys.stderr.write(
                       f"release tag {tag} does not match the Cargo package version (expected v{version})\n"
                   )
                   sys.exit(1)
 
+          if publish and ref == "refs/heads/main":
+              repository = os.environ["GITHUB_REPOSITORY"]
+              api = os.environ["GITHUB_API_URL"]
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/releases/tags/v{version}",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      publish = False
+                  sys.stdout.write(f"v{version} already has a release; skipping release jobs\n")
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={version}\n")
+              out.write(f"publish={str(publish).lower()}\n")
           sys.stdout.write(f"release version: v{version}\n")
 
   native:
     name: test, build, package (${{ matrix.platform }})
     needs: preflight
+    if: github.event_name == 'workflow_dispatch' || needs.preflight.outputs.publish == 'true'
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -269,8 +298,11 @@ jobs:
   publish:
     name: Publish release
     needs: [preflight, native]
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-22.04
+    concurrency:
+      group: release-v${{ needs.preflight.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -343,8 +375,26 @@ jobs:
         run: |
           set -euo pipefail
           tag="v${VERSION}"
-          # Ensure the tag object exists locally so --verify-tag can validate it.
-          git fetch origin "refs/tags/${tag}:refs/tags/${tag}" --depth 1
+          # Concurrent main/tag runs must never replace published assets.
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "release ${tag} already exists; leaving existing assets untouched"
+            exit 0
+          fi
+
+          # Main builds create the tag only after both platform jobs pass.
+          # Never publish binaries from a different commit under an existing tag.
+          if git ls-remote --exit-code origin "refs/tags/${tag}" >/dev/null; then
+            git fetch origin "refs/tags/${tag}:refs/tags/${tag}" --depth 1
+          else
+            status=$?
+            [ "$status" -eq 2 ] || exit "$status"
+            git tag "${tag}" HEAD
+            git push origin "refs/tags/${tag}"
+          fi
+          if [ "$(git rev-parse "${tag}^{commit}")" != "$(git rev-parse HEAD)" ]; then
+            echo "tag ${tag} points to a different commit; bump the Cargo version"
+            exit 1
+          fi
           files=(
             "release/files/kvr-v${VERSION}-linux-x86_64.tar.gz"
             "release/files/kvr-v${VERSION}-linux-x86_64.tar.gz.sha256"
@@ -352,10 +402,6 @@ jobs:
             "release/files/kvr-v${VERSION}-windows-x86_64.zip.sha256"
             "release/files/SHA256SUMS"
           )
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            echo "release ${tag} already exists; leaving existing assets untouched"
-            exit 1
-          fi
           gh release create "${tag}" \
             --title "${tag}" \
             --verify-tag \

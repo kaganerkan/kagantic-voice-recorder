@@ -258,41 +258,38 @@ bash scripts/package-release.sh v0.1.0 --bin-dir target/release --output-dir dis
 pwsh scripts/package-release.ps1 v0.1.0 -BinDir target/release -OutputDir dist
 ```
 
-**Tagged release vs manual dispatch.** A GitHub release is created only when a
-version tag matching the Cargo package version (currently `v0.1.0`) is
-**pushed**, after both the Linux and Windows test/build/package jobs pass.
-Manual dispatch of the release workflow — even selecting a tag in the
-dispatch UI — builds and uploads the archives as workflow **artifacts only**;
-it never creates a release.
+**Automatic releases from `main`.** Pushing to `main` publishes the Cargo package
+version if no GitHub release exists for it. Both Linux and Windows
+test/build/package jobs must pass before the workflow creates the matching
+`vX.Y.Z` tag at the tested commit and uploads the archives and checksums.
+Subsequent pushes with the same published version skip the release jobs;
+existing releases and assets are never overwritten.
+
+Pushed version tags remain supported and must match `Cargo.toml`.
+An existing tag must point to the tested commit; otherwise publication fails
+instead of labeling different binaries with that tag. Manual dispatch remains
+artifact-only, even when selecting a tag.
 
 <details>
-<summary>First GitHub publication</summary>
+<summary>Publishing a new version</summary>
 
-The repository is not yet on GitHub. First publish:
-
-1. Initialize and commit locally (`Cargo.lock` is tracked — intentionally part of the commit):
-
-   ```bash
-   git init -b main
-   git add .
-   git commit -m "kagantic-voice-recorder v0.1.0"
-   ```
-
-2. Create an empty repository on GitHub's web UI (no template README), set its URL as
-   the origin (use the actual URL shown in the web UI), then push the branch and
-   the matching version tag:
+1. Update the version in `Cargo.toml`, run `cargo check` to update `Cargo.lock`,
+   and update version-specific documentation.
+2. Commit those changes and push `main`:
 
    ```bash
-   git remote add origin <your-remote-url>
-   git push -u origin main
-   git tag v0.1.0
-   git push origin v0.1.0
+   git push origin main
    ```
 
-3. Watch the workflow: **both** the Linux and Windows test/build/package jobs
-   must pass; the publish job then creates the `v0.1.0` release with the two
-   archives and checksums. If either platform job fails, no release is created;
-   fix the failure before publishing.
+3. Watch the Release workflow. After both platform jobs pass, it creates the
+   matching version tag and GitHub release automatically; no manual tag push
+   is needed. The first unpublished version is also eligible, including the
+   current `0.1.0`.
+
+If a platform job fails, no tag or release is created. Fix the failure and push
+again, or rerun the failed workflow. If publication fails after tag creation,
+rerun the same workflow commit rather than moving the tag. To change code
+after a version is tagged, bump the version instead.
 </details>
 
 ## Codec and device details
@@ -357,4 +354,4 @@ must match the value in the sidecar / `SHA256SUMS`.
 - Source code: **AGPL-3.0-or-later** — [`LICENSE`](LICENSE)
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — bundled fonts (SIL OFL), Streamline icons (CC BY 4.0), the user-authored [`assets/pixel-art-logo.png`](assets/pixel-art-logo.png) (excluded from the source-code licenses — the project grants no additional redistribution rights to it), and the Opus codec components
 - [CONTRIBUTING.md](CONTRIBUTING.md) — prerequisites, quality gates, and testing notes
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — checks on every push and pull request; [`.github/workflows/release.yml`](.github/workflows/release.yml) — tag releases and manual artifact builds
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — checks on every push and pull request; [`.github/workflows/release.yml`](.github/workflows/release.yml) — automatic versioned releases from `main`, tag releases, and manual artifact builds
