@@ -307,14 +307,29 @@ pwsh scripts/package-release.ps1 v0.1.3 -BinDir target/release -OutputDir dist
 
 AppImage packaging needs Python Pillow (`python3-pil` on Ubuntu), `curl` and the
 native build dependencies. It verifies pinned linuxdeploy/GTK-plugin downloads,
-bundles GTK libraries/schemas/plugins and font notices, then extracts the image
-to validate desktop identity and logo pixels. CI runs the actual image under
-Xvfb/Mesa and checks its OS-facing icon and `WM_CLASS`, not just file existence.
+bundles GTK libraries/schemas/plugins and distribution-provided license notices,
+then extracts the image to validate desktop identity, logo pixels and library
+provenance. Official packages use Ubuntu 22.04; local Freedesktop SDK builds also
+carry the SDK's license files and source manifest.
+
+CI launches the actual image under Xvfb/Mesa and checks the window's
+`_NET_WM_ICON` pixels and `WM_CLASS`. This proves the running application's icon,
+not file-manager thumbnails or installed desktop integration.
+
+Bundled library copyright/license texts and exact-version source references are
+inside `usr/share/doc/kagantic-voice-recorder/libraries/`. To inspect them or
+replace a shared library without changing the system installation:
+
+```bash
+./kvr-gui-v0.1.3-linux-x86_64.AppImage --appimage-extract
+./squashfs-root/AppRun
+```
 
 **Automatic releases from `main`.** Pushing to `main` publishes the Cargo package
 version if no GitHub release exists for it. Both Linux and Windows
 test/build/package jobs must pass before the workflow creates the matching
-`vX.Y.Z` tag at the tested commit and uploads the archives and checksums.
+`vX.Y.Z` tag at the tested commit and uploads standalone applications, archives
+and checksums.
 Subsequent pushes with the same published version skip the release jobs;
 existing releases and assets are never overwritten.
 

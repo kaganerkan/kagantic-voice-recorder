@@ -115,8 +115,8 @@ ffmpeg -i recording.opus -f wav out.wav
   - Versions come from Cargo metadata and must be stable `X.Y.Z` values.
     Pushed tags must match `vX.Y.Z`.
   - After **both** platform test/build/package jobs pass, publication creates
-    the version tag at the tested commit if absent, then uploads the release
-    archives and checksums. An existing tag pointing elsewhere is rejected.
+    the version tag at the tested commit if absent, then uploads standalone
+    applications, archives and checksums. An existing tag pointing elsewhere is rejected.
   - Publication is serialized per version and never overwrites release assets.
     If publication fails after creating the tag, rerun that workflow commit;
     bump the version before publishing different code.

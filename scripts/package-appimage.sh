@@ -79,12 +79,14 @@ from pathlib import Path
 import sys
 from PIL import Image
 logo = Image.open(sys.argv[1]).convert('RGBA')
+# Ubuntu 22.04 ships Pillow 9.0, before the Resampling enum was added.
+nearest = getattr(Image, 'Resampling', Image).NEAREST
 root = Path(sys.argv[2])
 for size in (32, 64, 128, 256):
     destination = root / f'usr/share/icons/hicolor/{size}x{size}/apps/kagantic-voice-recorder.png'
     destination.parent.mkdir(parents=True, exist_ok=True)
-    logo.resize((size, size), Image.Resampling.NEAREST).save(destination)
-logo.resize((256, 256), Image.Resampling.NEAREST).save(root / 'kagantic-voice-recorder.png')
+    logo.resize((size, size), nearest).save(destination)
+logo.resize((256, 256), nearest).save(root / 'kagantic-voice-recorder.png')
 (root / '.DirIcon').symlink_to('kagantic-voice-recorder.png')
 PY
 
@@ -107,13 +109,16 @@ export OUTPUT
 (cd "$STAGING" && "$LINUXDEPLOY" --appdir "$APPDIR" \
   --executable "$BIN_DIR/kvr-gui" --executable "$BIN_DIR/kvr" \
   --desktop-file "$DESKTOP" --icon-file "$APPDIR/kagantic-voice-recorder.png" \
-  --plugin gtk --output appimage)
+  --plugin gtk)
+python3 "$ROOT_DIR/scripts/collect-appimage-notices.py" "$APPDIR"
+(cd "$STAGING" && "$LINUXDEPLOY" --appdir "$APPDIR" --output appimage)
 [ -x "$OUTPUT" ] || fail 'linuxdeploy did not produce the requested AppImage'
 mkdir "$STAGING/verify"
 (cd "$STAGING/verify" && "$OUTPUT" --appimage-extract >/dev/null)
 python3 - "$STAGING/verify/squashfs-root" "$ROOT_DIR/assets/pixel-art-logo.png" <<'PY'
 from pathlib import Path
 import configparser, sys
+import hashlib, json
 from PIL import Image
 root = Path(sys.argv[1])
 original = Image.open(sys.argv[2]).convert('RGBA')
@@ -125,15 +130,28 @@ assert entry['Exec'] == 'kvr-gui' and entry['Icon'] == 'kagantic-voice-recorder'
 assert entry['StartupWMClass'] == 'com.github.kaganerkan.KaganticVoiceRecorder'
 assert entry['Terminal'] == 'false'
 assert (root / 'AppRun').is_file() and (root / 'usr/bin/kvr-gui').is_file()
+nearest = getattr(Image, 'Resampling', Image).NEAREST
 for path in [root / '.DirIcon', root / 'kagantic-voice-recorder.png'] + [
         root / f'usr/share/icons/hicolor/{s}x{s}/apps/kagantic-voice-recorder.png' for s in (32, 64, 128, 256)]:
     image = Image.open(path).convert('RGBA')
     assert image.size in [(s, s) for s in (32, 64, 128, 256)], (path, image.size)
-    assert image.tobytes() == original.resize(image.size, Image.Resampling.NEAREST).tobytes(), path
+    assert image.tobytes() == original.resize(image.size, nearest).tobytes(), path
 assert list(root.glob('usr/lib/libgtk-3.so*')), 'GTK3 not bundled'
 assert list(root.glob('usr/share/glib-2.0/schemas/gschemas.compiled')), 'GLib schemas not bundled'
 for notice in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'assets/fonts/Silkscreen-OFL.txt', 'assets/fonts/VT323-OFL.txt', 'assets/fonts/DotGothic16-OFL.txt'):
     assert (root / notice).is_file(), notice
+notices = root / 'usr/share/doc/kagantic-voice-recorder/libraries'
+provenance = json.loads((notices / 'provenance.json').read_text())
+for library in provenance['libraries']:
+    assert hashlib.sha256((root / library['path']).read_bytes()).hexdigest() == library['sha256']
+if provenance['distribution'] == 'Freedesktop SDK':
+    assert (notices / 'freedesktop-sdk-manifest.json').is_file()
+    assert (notices / 'freedesktop-sdk-licenses/freedesktop-sdk/gtk3/COPYING').is_file()
+else:
+    assert (notices / 'common-licenses/LGPL-2.1').is_file()
+    for package in provenance['packages']:
+        assert (notices / (package['binary'] + '.copyright')).is_file()
+        assert package['source_url']
 print('Extracted AppImage desktop identity, original-logo pixels, GTK3, schemas and notices verified')
 PY
 # noclobber opens exclusively; a concurrent packaging run cannot overwrite assets.

@@ -149,3 +149,21 @@ https://github.com/DoumanAsh/opusic-sys — "This crate has the same license
 requirements as C source code" (README); its `LICENSE` file contains the
 identical libopus text reproduced above. All modifications to the bundled
 source are described in the crate's `opus.patch`.
+
+## Linux AppImage shared libraries
+
+The AppImage also carries dynamically linked GTK and its native dependencies.
+These libraries retain their distribution-provided licenses; the project's AGPL
+license does not replace them.
+
+The packaging process includes copyright/license files and a `provenance.json`
+inventory under `usr/share/doc/kagantic-voice-recorder/libraries/` inside the
+image. Ubuntu/Debian packages are identified by GNU build IDs, with exact binary
+and source versions and source-archive links. Freedesktop SDK builds include the
+SDK's original license files and source manifest with source URLs/revisions.
+Packaging adjusts ELF RPATH and may strip debug symbols; it does not change
+library source code.
+
+Run the AppImage with `--appimage-extract` to inspect these files. The extracted
+`usr/lib/` shared libraries can be replaced with interface-compatible modified
+versions; run the extracted `AppRun` to use that copy.
