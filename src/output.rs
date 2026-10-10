@@ -1,9 +1,8 @@
 //! Output format selection + linear resampling helpers.
 //!
 //! `OutputFormat` enumerates every container the recorder can write.
-//! `resample_linear` is the cheap one-shot resampler used by the non-Opus
-//! sinks when the negotiated capture sample rate differs from the device's
-//! native rate.
+//! PCM retains the capture clock. Opus uses a channel-aware streaming linear
+//! resampler with integer phase, so callback boundaries do not change duration.
 
 use std::fmt;
 use std::str::FromStr;
@@ -81,38 +80,76 @@ impl clap::ValueEnum for OutputFormat {
     }
 }
 
-/// Resample interleaved float samples from `src_rate` to `dst_rate` using
-/// piecewise-linear interpolation. Equal rates short-circuit to a clone of
-/// the input slice; the output length is `ceil(samples.len() * dst / src)`,
-/// which matches what callers need when they're not keeping a long history.
-pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-    if src_rate == 0 || dst_rate == 0 {
-        return samples.to_vec();
-    }
-    if src_rate == dst_rate {
-        return samples.to_vec();
-    }
-    let src = samples.len() as f64;
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((src * ratio).ceil() as usize).max(1);
-    let mut out = Vec::with_capacity(out_len);
-    let last_index = (samples.len() - 1) as f64;
-    for i in 0..out_len {
-        let pos = (i as f64) / ratio;
-        if pos >= last_index {
-            out.push(samples[samples.len() - 1]);
-            continue;
+/// Streaming interleaved resampling; retains the interpolation boundary only.
+pub(crate) struct OpusResampler {
+    samples: std::collections::VecDeque<f32>,
+    src_rate: u32,
+    channels: usize,
+    input_frames: u64,
+    base_frame: u64,
+    output_frames: u64,
+}
+
+impl OpusResampler {
+    pub(crate) fn new(src_rate: u32, channels: u8) -> Result<Self> {
+        if src_rate == 0 || !(1..=2).contains(&channels) {
+            return Err(anyhow_err!(
+                "invalid capture format: {channels} channels at {src_rate} Hz"
+            ));
         }
-        let i0 = pos.floor() as usize;
-        let frac = (pos - i0 as f64) as f32;
-        let a = samples[i0];
-        let b = samples[i0 + 1];
-        out.push(a + (b - a) * frac);
+        Ok(Self {
+            samples: std::collections::VecDeque::new(),
+            src_rate,
+            channels: channels as usize,
+            input_frames: 0,
+            base_frame: 0,
+            output_frames: 0,
+        })
     }
-    out
+
+    pub(crate) fn convert(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+        finish: bool,
+    ) -> Result<()> {
+        if !input.len().is_multiple_of(self.channels) {
+            return Err(anyhow_err!("incomplete interleaved capture frame"));
+        }
+        if self.src_rate == 48_000 {
+            output.extend_from_slice(input);
+            self.input_frames += (input.len() / self.channels) as u64;
+            self.output_frames = self.input_frames;
+            return Ok(());
+        }
+        self.samples.extend(input.iter().copied());
+        self.input_frames += (input.len() / self.channels) as u64;
+        let target = (self.input_frames * 48_000).div_ceil(u64::from(self.src_rate));
+        while self.output_frames < target {
+            let position = self.output_frames * u64::from(self.src_rate);
+            let left = position / 48_000;
+            let fraction = (position % 48_000) as f32 / 48_000.0;
+            if !finish && fraction != 0.0 && left + 1 >= self.input_frames {
+                break;
+            }
+            let right = (left + 1).min(self.input_frames - 1);
+            for channel in 0..self.channels {
+                let a = self.samples[(left - self.base_frame) as usize * self.channels + channel];
+                let b = self.samples[(right - self.base_frame) as usize * self.channels + channel];
+                output.push(a + (b - a) * fraction);
+            }
+            self.output_frames += 1;
+        }
+        let next = (self.output_frames * u64::from(self.src_rate) / 48_000).min(self.input_frames);
+        let discard = (next - self.base_frame) as usize * self.channels;
+        self.samples.drain(..discard);
+        self.base_frame = next;
+        Ok(())
+    }
+
+    pub(crate) fn output_frames(&self) -> u64 {
+        self.output_frames
+    }
 }
 
 #[cfg(test)]
@@ -154,28 +191,27 @@ mod tests {
     }
 
     #[test]
-    fn resample_passthrough_when_rates_match() {
-        let input = vec![0.1, 0.2, 0.3, 0.4];
-        let out = resample_linear(&input, 48_000, 48_000);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn resample_doubles_count_when_doubling_rate() {
-        // 4 samples @ 1Hz → 8 samples @ 2Hz (endpoints included).
-        let input = vec![0.0, 1.0, 0.0, 1.0];
-        let out = resample_linear(&input, 1, 2);
-        assert_eq!(out.len(), 8);
-        assert!((out[0] - 0.0).abs() < 1e-6);
-        assert!((out[4] - 0.0).abs() < 1e-6);
-        assert!((out[7] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn resample_clamps_to_last_sample_for_short_input() {
-        // 2 samples @ 1Hz → 1 sample @ 1Hz still produces a copy.
-        let input = vec![0.5, 1.0];
-        let out = resample_linear(&input, 1, 1);
-        assert_eq!(out, input);
+    fn streaming_resampling_is_chunk_invariant_and_does_not_mix_channels() {
+        let input: Vec<f32> = (0..44_101)
+            .flat_map(|index| [index as f32 / 44_101.0, -0.5])
+            .collect();
+        let mut whole = OpusResampler::new(44_100, 2).unwrap();
+        let mut expected = Vec::new();
+        whole.convert(&input, &mut expected, true).unwrap();
+        let mut chunked = OpusResampler::new(44_100, 2).unwrap();
+        let mut actual = Vec::new();
+        for chunk in input.chunks(254) {
+            chunked.convert(chunk, &mut actual, false).unwrap();
+        }
+        chunked.convert(&[], &mut actual, true).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.len(),
+            (44_101u64 * 48_000).div_ceil(44_100) as usize * 2
+        );
+        for frame in actual.as_chunks::<2>().0 {
+            assert_eq!(frame[1], -0.5);
+            assert!((0.0..1.0).contains(&frame[0]));
+        }
     }
 }

@@ -30,12 +30,11 @@
 #     pwsh scripts/package-release.ps1 v0.1.1 -Platform windows -BinDir target/x86_64-pc-windows-msvc/release -OutputDir dist
 #
 # The version (with or without a leading "v") must equal the Cargo package
-# version. Binaries are validated as PE x86-64 before packaging, and on a
-# native Windows host the CLI is smoke-tested (kvr --version must
-# report exactly `kvr <VERSION>`). Both binaries must be free of dynamically
-# linked Visual C++ runtime DLLs (checked with dumpbin on Windows, objdump on Linux).
-# The script never succeeds with missing or mismatched inputs and never
-# overwrites an existing archive or sidecar.
+# version. Python 3 inspects x86-64 PE32+ headers: GUI Subsystem 2, CLI
+# Subsystem 3. Both source binaries and the extracted ZIP are checked.
+# Native Windows also smoke-tests the extracted CLI. Both binaries must be
+# free of Visual C++ runtime DLL imports (dumpbin/objdump inspection).
+# The script never overwrites an existing archive or sidecar.
 
 [CmdletBinding()]
 param(
@@ -138,26 +137,10 @@ if ($cargoVersion -ne $V) {
     throw "version $V does not match the Cargo package version $cargoVersion"
 }
 
-# Reject binaries that are not genuine PE x86-64 executables.
-function Test-PeX64 {
-    param([string]$Path)
-    $stream = [System.IO.File]::OpenRead($Path)
-    try {
-        $buf = New-Object byte[] 4
-        if ($stream.Read($buf, 0, 4) -ne 4) { return $false }
-        if ($buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) { return $false }
-        $stream.Seek(0x3C, 'Begin') | Out-Null
-        if ($stream.Read($buf, 0, 4) -ne 4) { return $false }
-        $peOffset = [BitConverter]::ToInt32($buf, 0)
-        if ($peOffset -lt 0 -or $peOffset -gt $stream.Length - 6) { return $false }
-        $stream.Seek($peOffset, 'Begin') | Out-Null
-        $peSig = New-Object byte[] 6
-        if ($stream.Read($peSig, 0, 6) -ne 6) { return $false }
-        if ($peSig[0] -ne 0x50 -or $peSig[1] -ne 0x45 -or $peSig[2] -ne 0 -or $peSig[3] -ne 0) { return $false }
-        return ([BitConverter]::ToUInt16($peSig, 4) -eq 0x8664)
-    }
-    finally { $stream.Dispose() }
-}
+$python = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+if (-not $python) { throw 'Python 3 is required for portable PE header checks' }
+$peChecker = Join-Path $ScriptDir 'check-windows-pe.py'
 
 # Build runners have the redistributable installed, so executing there alone
 # cannot detect a release that would fail on a clean Windows machine.
@@ -183,10 +166,12 @@ else {
     $dependencyTool = $objdump.Source
 }
 
+function Assert-WindowsBinaries {
+    param([string]$Directory)
+    & $python.Source $peChecker --cli (Join-Path $Directory 'kvr.exe') --gui (Join-Path $Directory 'kvr-gui.exe')
+    if ($LASTEXITCODE -ne 0) { throw "PE subsystem/architecture check failed in $Directory" }
 foreach ($bin in @('kvr', 'kvr-gui')) {
-    $src = Join-Path $BinDirAbs ($bin + $exe)
-    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "missing release binary: $src" }
-    if (-not (Test-PeX64 $src)) { throw "$src is not a Windows x86-64 PE executable" }
+    $src = Join-Path $Directory ($bin + $exe)
     if ($hostWindows) {
         $dependencies = & $dependencyTool /nologo /dependents $src 2>&1
     }
@@ -203,7 +188,7 @@ foreach ($bin in @('kvr', 'kvr-gui')) {
 # Smoke the CLI on a native Windows host: --help and --version must
 # succeed, and --version must report exactly `kvr <VERSION>`.
 if ($hostWindows) {
-    $cli = Join-Path $BinDirAbs ('kvr' + $exe)
+    $cli = Join-Path $Directory ('kvr' + $exe)
     $help = & $cli --help 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kvr --help failed: $($help -join ' ')" }
     $versionOut = & $cli --version 2>&1
@@ -217,6 +202,9 @@ else {
     Write-Host 'note: cross-built PE binaries; Windows runtime smoke test (kvr --help/--version) is NOT performed'
 }
 
+}
+
+Assert-WindowsBinaries $BinDirAbs
 $rootName = "kvr-v$V-windows-x86_64"
 $staging = Join-Path ([System.IO.Path]::GetTempPath()) ('kvr-pack-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null
@@ -252,9 +240,25 @@ try {
     if (Test-Path -LiteralPath $archivePath) { throw "output already exists (not overwriting): $archivePath" }
     if (Test-Path -LiteralPath $sidecarPath) { throw "output already exists (not overwriting): $sidecarPath" }
 
-    Compress-Archive -LiteralPath $destRoot -DestinationPath $archivePath -CompressionLevel Optimal
-    # Enforce the single-root-directory layout.
+    # Windows PowerShell 5.1's Compress-Archive can emit backslash names.
+    # Create entries explicitly so every host writes canonical ZIP paths.
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archiveStream = [System.IO.File]::Open($archivePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    try {
+        $writer = [System.IO.Compression.ZipArchive]::new($archiveStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($file in Get-ChildItem -LiteralPath $destRoot -File -Recurse) {
+                $entryName = $file.FullName.Substring($staging.Length + 1).Replace('\', '/')
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $writer, $file.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+            }
+        }
+        finally { $writer.Dispose() }
+    }
+    finally { $archiveStream.Dispose() }
+    # Enforce the single-root-directory layout.
     $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
     try {
         foreach ($entry in $zip.Entries) {
@@ -264,10 +268,18 @@ try {
         }
     }
     finally { $zip.Dispose() }
+    $extracted = Join-Path $staging 'extracted'
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $extracted
+    Assert-WindowsBinaries (Join-Path $extracted $rootName)
 
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
     if ($hash -notmatch '^[0-9a-f]{64}$') { throw "unexpected SHA-256 output: $hash" }
-    [System.IO.File]::WriteAllText($sidecarPath, "$hash  $archiveName`n")
+    $sidecarStream = [System.IO.File]::Open($sidecarPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    try {
+        $sidecarBytes = [System.Text.Encoding]::UTF8.GetBytes("$hash  $archiveName`n")
+        $sidecarStream.Write($sidecarBytes, 0, $sidecarBytes.Length)
+    }
+    finally { $sidecarStream.Dispose() }
 
     $parts = ([System.IO.File]::ReadAllText($sidecarPath)).Trim() -split '\s+'
     if ($parts.Count -ne 2 -or $parts[0] -ne $hash -or $parts[1] -ne $archiveName) {

@@ -25,6 +25,9 @@ pub trait FrameSink: Send {
     /// Called once after the recorder stops; flushes and (if applicable)
     /// back-patches container sizes.
     fn finalize(&mut self) -> Result<()>;
+    /// Total file bytes, including container overhead; header back-patches do
+    /// not increase this count. Finalization may append additional bytes.
+    fn bytes_written(&self) -> u64;
 }
 
 // -- OggOpusSink ------------------------------------------------------------
@@ -38,14 +41,21 @@ pub struct OggOpusSink {
     pub fmt: CaptureFormat,
     frames_emitted: u64,
     header_written: bool,
+    resampler: crate::output::OpusResampler,
+    pending_samples: Vec<f32>,
+    pending_packet: Option<Vec<u8>>,
+    finalized: bool,
 }
 
 impl OggOpusSink {
     /// Convenience constructor that opens `path` and prepares an encoder
     /// for the negotiated format at `bitrate_bps`.
     pub fn new_file(path: &std::path::Path, fmt: &CaptureFormat, bitrate_bps: i32) -> Result<Self> {
-        let file =
-            File::create(path).map_err(|e| anyhow!("create ogg output {}: {e}", path.display()))?;
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| anyhow!("create ogg output {}: {e}", path.display()))?;
         Self::new(file, fmt, bitrate_bps)
     }
 
@@ -57,7 +67,27 @@ impl OggOpusSink {
             fmt: fmt.clone(),
             frames_emitted: 0,
             header_written: false,
+            resampler: crate::output::OpusResampler::new(fmt.sample_rate, fmt.channels)?,
+            pending_samples: Vec::with_capacity(960 * fmt.channels as usize),
+            pending_packet: None,
+            finalized: false,
         })
+    }
+
+    fn encode_pending(&mut self) -> Result<()> {
+        let need = self.encoder.frame_size() * self.fmt.channels as usize;
+        let complete = self.pending_samples.len() / need;
+        for index in 0..complete {
+            let packet = self
+                .encoder
+                .encode_f32(&self.pending_samples[index * need..(index + 1) * need])?;
+            if let Some(previous) = self.pending_packet.replace(packet) {
+                self.ogg.write_audio(&previous, self.frames_emitted * 960)?;
+            }
+            self.frames_emitted += 1;
+        }
+        self.pending_samples.drain(..complete * need);
+        Ok(())
     }
 }
 
@@ -72,22 +102,44 @@ impl FrameSink for OggOpusSink {
     }
 
     fn write_frames(&mut self, frames: &[f32], _fmt: &CaptureFormat) -> Result<()> {
-        let packet = self.encoder.encode_f32(frames)?;
-        let granule = (self.frames_emitted + 1) * self.encoder.frame_size() as u64;
-        self.ogg.write_audio(&packet, granule)?;
-        self.frames_emitted += 1;
-        Ok(())
+        if self.finalized {
+            return Err(anyhow!("Opus sink already finalized"));
+        }
+        self.resampler
+            .convert(frames, &mut self.pending_samples, false)?;
+        self.encode_pending()
     }
 
     fn finalize(&mut self) -> Result<()> {
-        if !self.header_written {
-            // Recorder stopped before any audio was captured: skip EOS, the
-            // BOS + OpusTags pages alone are still well-formed.
+        if self.finalized {
             return Ok(());
         }
-        let granule = self.frames_emitted * self.encoder.frame_size() as u64;
-        self.ogg.write_eos(&[], granule)?;
+        if !self.header_written {
+            self.write_header(&self.fmt.clone())?;
+        }
+        self.resampler
+            .convert(&[], &mut self.pending_samples, true)?;
+        // Encode the tail and encoder delay; the final audio page's granule
+        // trims padding while pre-skip removes the initial lookahead.
+        let final_granule =
+            self.resampler.output_frames() + u64::from(crate::encoder::pre_skip_samples());
+        let channels = self.fmt.channels as usize;
+        self.pending_samples
+            .resize(self.pending_samples.len() + 312 * channels, 0.0);
+        let need = self.encoder.frame_size() * channels;
+        self.pending_samples
+            .resize(self.pending_samples.len().div_ceil(need) * need, 0.0);
+        self.encode_pending()?;
+        if let Some(packet) = self.pending_packet.take() {
+            self.ogg.write_eos(&packet, final_granule)?;
+        }
+        self.ogg.flush()?;
+        self.finalized = true;
         Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.ogg.bytes_written()
     }
 }
 
@@ -102,14 +154,17 @@ impl FrameSink for OggOpusSink {
 pub struct WavSink<W: Write + Seek> {
     pub writer: Option<W>,
     pub fmt: CaptureFormat,
-    pub bytes_written: u32,
+    pub bytes_written: u64,
     header_written: bool,
 }
 
 impl WavSink<File> {
     pub fn new_file(path: &std::path::Path, fmt: &CaptureFormat) -> Result<Self> {
-        let file =
-            File::create(path).map_err(|e| anyhow!("create wav output {}: {e}", path.display()))?;
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| anyhow!("create wav output {}: {e}", path.display()))?;
         Ok(Self::new(file, fmt.clone()))
     }
 }
@@ -173,6 +228,13 @@ impl<W: Write + Seek + Send> FrameSink for WavSink<W> {
     }
 
     fn write_frames(&mut self, frames: &[f32], _fmt: &CaptureFormat) -> Result<()> {
+        if self
+            .bytes_written
+            .checked_add(frames.len() as u64 * 2)
+            .is_none_or(|size| size > u64::from(u32::MAX) - 36)
+        {
+            return Err(anyhow!("WAV recording exceeds the classic RIFF size limit; stop before 4 GiB or use Opus/raw"));
+        }
         let writer = self
             .writer
             .as_mut()
@@ -180,7 +242,7 @@ impl<W: Write + Seek + Send> FrameSink for WavSink<W> {
         for sample in frames {
             let encoded = Self::encode_i16(*sample).to_le_bytes();
             writer.write_all(&encoded)?;
-            self.bytes_written += encoded.len() as u32;
+            self.bytes_written += encoded.len() as u64;
         }
         Ok(())
     }
@@ -195,21 +257,27 @@ impl<W: Write + Seek + Send> FrameSink for WavSink<W> {
         if !self.header_written {
             // Empty recording: still a valid (silent) WAV header.
             writer.seek(SeekFrom::Start(0))?;
-            let header = Self::build_header(&self.fmt);
+            let mut header = Self::build_header(&self.fmt);
+            header[4..8].copy_from_slice(&36u32.to_le_bytes());
             writer.write_all(&header)?;
             writer.flush()?;
         } else {
             writer.flush()?;
             // RIFF ChunkSize = 36 + Subchunk2Size
             writer.seek(SeekFrom::Start(4))?;
-            let riff_size = self.bytes_written + 36;
+            let riff_size = u32::try_from(self.bytes_written + 36)?;
             writer.write_all(&riff_size.to_le_bytes())?;
             // Subchunk2Size = data_size
             writer.seek(SeekFrom::Start(40))?;
-            writer.write_all(&self.bytes_written.to_le_bytes())?;
+            writer.write_all(&u32::try_from(self.bytes_written)?.to_le_bytes())?;
             writer.flush()?;
         }
+        self.header_written = true;
         Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written + if self.header_written { 44 } else { 0 }
     }
 }
 
@@ -222,12 +290,16 @@ pub struct RawF32Sink<W: Write> {
     pub writer: Option<W>,
     pub fmt: CaptureFormat,
     header_written: bool,
+    bytes_written: u64,
 }
 
 impl RawF32Sink<File> {
     pub fn new_file(path: &std::path::Path, fmt: &CaptureFormat) -> Result<Self> {
-        let file =
-            File::create(path).map_err(|e| anyhow!("create raw output {}: {e}", path.display()))?;
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| anyhow!("create raw output {}: {e}", path.display()))?;
         Ok(Self::new(file, fmt.clone()))
     }
 }
@@ -238,6 +310,7 @@ impl<W: Write> RawF32Sink<W> {
             writer: Some(writer),
             fmt,
             header_written: false,
+            bytes_written: 0,
         }
     }
 }
@@ -257,6 +330,7 @@ impl<W: Write + Send> FrameSink for RawF32Sink<W> {
             .ok_or_else(|| anyhow!("raw sink writer already released"))?;
         for sample in frames {
             writer.write_all(&sample.to_le_bytes())?;
+            self.bytes_written += 4;
         }
         Ok(())
     }
@@ -269,6 +343,67 @@ impl<W: Write + Send> FrameSink for RawF32Sink<W> {
         }
         Ok(())
     }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+/// Open a no-overwrite sink at the negotiated input clock. Only Opus resamples.
+pub fn open_sink(
+    path: &std::path::Path,
+    fmt: &CaptureFormat,
+    format: crate::output::OutputFormat,
+    bitrate: i32,
+) -> Result<Box<dyn FrameSink>> {
+    let mut sink: Box<dyn FrameSink> = match format {
+        crate::output::OutputFormat::Opus => Box::new(OggOpusSink::new_file(path, fmt, bitrate)?),
+        crate::output::OutputFormat::WavPcm16le => Box::new(WavSink::new_file(path, fmt)?),
+        crate::output::OutputFormat::RawF32le => Box::new(RawF32Sink::new_file(path, fmt)?),
+    };
+    sink.write_header(fmt)?;
+    Ok(sink)
+}
+
+/// Drain bounded batches outside the callback lock, retaining a reusable buffer.
+/// Returns interleaved sample count and sum of squares for duration/RMS.
+pub fn drain_capture(
+    accum: &crate::audio::Accum,
+    sink: &mut dyn FrameSink,
+    fmt: &CaptureFormat,
+    finish: bool,
+    buffer: &mut Vec<f32>,
+) -> Result<(u64, f64)> {
+    let channels = usize::from(fmt.channels);
+    let block = (fmt.sample_rate as usize / 100).max(1) * channels;
+    let mut samples = 0;
+    let mut squares = 0.0;
+    loop {
+        buffer.clear();
+        {
+            let mut input = accum.lock();
+            let available = input.len() / channels * channels;
+            if available < block && !finish {
+                break;
+            }
+            let count = available.min(block);
+            if count == 0 {
+                break;
+            }
+            buffer.extend(input.drain(..count));
+        }
+        squares += buffer.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+        if let Err(error) = sink.write_frames(buffer, fmt) {
+            return match sink.finalize() {
+                Ok(()) => Err(error.context("write recording; partial file finalized")),
+                Err(finalization) => Err(error.context(format!(
+                    "write recording; partial-file finalization also failed: {finalization:#}"
+                ))),
+            };
+        }
+        samples += buffer.len() as u64;
+    }
+    Ok((samples, squares))
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -277,6 +412,63 @@ impl<W: Write + Send> FrameSink for RawF32Sink<W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn empty_wav_finalization_writes_valid_sizes_without_a_prior_header() {
+        let mut bytes = Vec::new();
+        let mut sink = WavSink::new(Cursor::new(&mut bytes), test_fmt());
+        sink.finalize().unwrap();
+        assert_eq!(sink.bytes_written(), 44);
+        assert_eq!(bytes.len(), 44);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 36);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn wav_riff_limit_is_rejected_before_writing_or_wrapping() {
+        #[derive(Default)]
+        struct SparseWriter {
+            position: u64,
+            length: u64,
+        }
+        impl Write for SparseWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.position += bytes.len() as u64;
+                self.length = self.length.max(self.position);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for SparseWriter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.position = match position {
+                    SeekFrom::Start(position) => position,
+                    SeekFrom::End(offset) => self.length.checked_add_signed(offset).unwrap(),
+                    SeekFrom::Current(offset) => self.position.checked_add_signed(offset).unwrap(),
+                };
+                Ok(self.position)
+            }
+        }
+        let mut sink = WavSink::new(SparseWriter::default(), test_fmt());
+        sink.write_header(&test_fmt()).unwrap();
+        sink.bytes_written = u64::from(u32::MAX) - 39;
+        let writer = sink.writer.as_mut().unwrap();
+        writer.length = sink.bytes_written + 44;
+        writer.position = writer.length;
+        sink.write_frames(&[0.25], &test_fmt()).unwrap();
+        let before = sink.bytes_written();
+        assert!(sink
+            .write_frames(&[0.25], &test_fmt())
+            .unwrap_err()
+            .to_string()
+            .contains("RIFF size limit"));
+        assert_eq!(sink.bytes_written(), before);
+        assert_eq!(sink.writer.as_ref().unwrap().length, before);
+        sink.finalize().unwrap();
+        assert_eq!(sink.bytes_written(), before);
+    }
 
     fn test_fmt() -> CaptureFormat {
         CaptureFormat {

@@ -70,11 +70,25 @@ bitflags::bitflags! {
 pub struct OggWriter {
     file: File,
     page_seq: u32,
+    bytes_written: u64,
 }
 
 impl OggWriter {
     pub fn new(file: File) -> Self {
-        Self { file, page_seq: 0 }
+        Self {
+            file,
+            page_seq: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Complete bytes successfully emitted, including page headers and lacing.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
     }
 
     /// Emit a "beginning of stream" page containing `header_packet`.
@@ -139,8 +153,11 @@ impl OggWriter {
         header[22..26].copy_from_slice(&crc.to_le_bytes());
 
         self.file.write_all(&header)?;
+        self.bytes_written += header.len() as u64;
         self.file.write_all(&seg_table)?;
+        self.bytes_written += seg_table.len() as u64;
         self.file.write_all(packet)?;
+        self.bytes_written += packet.len() as u64;
 
         self.page_seq = self.page_seq.wrapping_add(1);
         Ok(())

@@ -48,7 +48,7 @@ The CLI requires a subcommand; recording starts with `start`:
 # Linux
 ./kvr start                                  # system mic, 96 kbps → ./recording-<timestamp>.opus
 ./kvr start -o my-take.opus --bitrate 128000   # explicit output path and bitrate
-./kvr start --channels 1 --sample-rate 48000  # force channels / sample rate
+./kvr start --channels 1 --sample-rate 48000  # require supported mono input at the negotiated 48 kHz rate
 ./kvr start --dir ~/recordings
 ```
 
@@ -105,15 +105,35 @@ ffmpeg -i recording.opus -f wav out.wav
 .\kvr-gui.exe
 ```
 
+On Windows, open `kvr-gui.exe` directly from Explorer. Rebuilt GUI binaries
+use the Windows GUI subsystem; the CLI intentionally retains its console.
+The existing v0.1.1 download is not changed by this source repair.
+
 The native window provides:
 
 - A microphone picker with readable device descriptions, plus a **System default microphone** choice
 - An output path field with a native save-file dialog, and a bitrate slider: 16–256 kbps in 8 kbps steps (default 96 kbps)
-- Record / Pause / Resume / Stop controls; a duration timer (pauses excluded), encoded-audio size, and a live RMS input meter with level history that freezes while paused
+- Record / Pause / Resume / Stop controls; a duration timer (pauses excluded), actual file size in KiB including container overhead (refreshed after finalization), and a live RMS input meter with level history that freezes while paused
 - Visible recording state, actionable error messages, and settings locked while a take is active; closing the window finalizes the current recording before exit
 
 Capture and Opus encoding run on a separate thread so the UI can stay responsive.
 The interface is native Rust (`egui`/`eframe` with the `glow` OpenGL renderer) — not a browser or embedded web UI.
+
+**Destination and diagnostics.** The GUI chooses a writable platform user
+directory: Music/Kagantic Voice Recorder when available, then local user
+data/Recordings, then a home-directory fallback. If those are unavailable,
+it uses an explicitly displayed per-process temporary recording directory,
+never the installation folder or current working directory. The resolved
+absolute destination is shown during a take. A custom path still wins.
+The GUI writes local diagnostics to `gui.log` in the platform local-data
+`Kagantic Voice Recorder/Logs` directory (or an indicated temporary fallback);
+the session panel shows the path or a logging initialization error.
+
+Capture diagnostics distinguish missing/newly absent callbacks, callbacks
+with all-zero samples, and nonzero samples. Silence is valid input, not a
+recording failure. Asynchronous backend errors stop recording and report the
+error and partial-file destination after finalizing the captured audio,
+including errors received while paused. A backend failure is not labeled SAVED.
 
 **Visual design.** The workspace uses a pixel identity — navy/blue/cream/sand
 palette, square frames, zero-blur offset shadows — with embedded Silkscreen,
@@ -123,7 +143,7 @@ VT323, and DotGothic16 fonts (SIL OFL) and Streamline Pixel artwork (CC BY
 ## Recording behavior
 
 - **Pause exclusion.** Pausing discards the partial frame at the boundary and everything captured while paused — it is never written as silence; resuming continues the same take with strictly increasing granule positions.
-- **No overwrite.** The recorder never overwrites: if the chosen output path exists, a numeric suffix (`-1`, `-2`, `-3`, …) is appended automatically. The CLI default filename uses a one-second-resolution timestamp; the GUI default `<home>/recording.<ext>` is replaced with `<home>/<YYYYMMDD-HHMMSS>.<ext>` at the moment you press RECORD, so two presses inside the same second still produce two unique filenames (`<…>-1.<ext>`, `<…>-2.<ext>`). Explicit `-o` / `--output` paths and user-typed GUI stems get the same collision suffix. No `--force`/`--yes` flag is needed and an in-progress take is never silently lost to a new recording.
+- **No overwrite.** Existing names get a numeric suffix (`-1`, `-2`, …). The GUI's default `recording.<ext>` placeholder is resolved to `YYYYMMDD-HHMMSS.<ext>` inside the chosen user directory at Record time. CLI defaults and custom stems retain their existing collision naming. Sinks use exclusive file creation, so a race creating the same name fails rather than truncating an existing take.
 - **Local and private.** Capture, encoding, and writing all happen on your machine — no network, cloud, account, or telemetry. Besides recordings, the CLI stores session metadata in `session.json` (locate it with `kvr where`).
 
 ## Recording formats
@@ -157,6 +177,13 @@ can't read Ogg/Opus. The selection is a single flag.
 the recorder writes WAV data to `take.opus` (the filename you typed). The
 extension is a hint for downstream tools, not a write-time gate. Pass
 `--extension` to override the suffix on `-o` without renaming the file by hand.
+
+Capture negotiation uses an actual advertised mono/stereo F32, I16 or U16
+configuration, preferring 48 kHz without inventing unsupported rates or
+channel counts. A 44.1 kHz-only input remains 44.1 kHz. Opus resamples each
+channel to 48 kHz with continuous phase; WAV/raw retain the capture clock.
+`--channels` requires a supported channel count; `--sample-rate` checks the
+negotiated rate and reports a mismatch instead of mislabeling the samples.
 
 ### `--extension` (override)
 
@@ -297,13 +324,14 @@ after a version is tagged, bump the version instead.
 <details>
 <summary>Container format</summary>
 
-Each output file is one logical Ogg stream (serial = 1) carrying, in
-order: the `OpusHead` identification packet (channel count, pre-skip,
-input sample rate), the `OpusTags` comment packet, Opus audio packets —
-20 ms frames at 48 kHz, granule position = frames × 960 samples — and a
-final EOS page with the stream-end flag. Page headers and the CRC-32
-parameters follow RFC 3533; the implementation is in
-[`src/ogg.rs`](src/ogg.rs).
+Each Opus output is one logical Ogg stream (serial = 1) containing
+`OpusHead` (original input sample rate, channels, pre-skip), `OpusTags`,
+and 20 ms audio packets encoded at 48 kHz. The final audio packet carries
+EOS. Granules use the 48 kHz clock; the final granule is the resampled
+audio sample count plus the 312-sample encoder lookahead. Decoders remove
+pre-skip and trim final padding, including partial last capture blocks.
+`ffprobe` container duration may include pre-skip; decoded sample count
+measures the actual take duration. Ogg framing/CRC live in [`src/ogg.rs`](src/ogg.rs).
 
 </details>
 
@@ -325,16 +353,23 @@ Implementation: [`src/devices.rs`](src/devices.rs).
 The Windows release archive is built on the `windows-2022` GitHub-hosted
 runner with the MSVC + Windows SDK toolchain (Visual Studio Build Tools,
 "Desktop development with C++") plus CMake. `scripts/package-release.ps1`
-refuses to overwrite an existing archive, requires every binary to be a
-real PE x86-64 file, rejects Visual C++ runtime DLL imports in either executable,
-validates the single-root directory structure of the ZIP, and writes a SHA-256
-sidecar. Dependency inspection uses `dumpbin` from Visual Studio Build Tools
-on Windows, or `objdump` (binutils) when cross-packaging on Linux.
-The Windows CLI is smoke-tested
-(`--help` / `--version`) only on the `windows-2022` runner, where it must
-report exactly `kvr <version>` before the archive is uploaded. Linux
-runners cannot execute Windows PE binaries, so the per-platform CLI smoke
-remains platform-local.
+refuses to overwrite an existing archive, checks x86-64 PE32+ headers and
+requires GUI Subsystem 2 / CLI Subsystem 3, rejects Visual C++ runtime DLL
+imports, validates the single-root ZIP, and writes a SHA-256 sidecar.
+The extracted ZIP binaries receive the same PE and runtime-import checks.
+Dependency inspection uses `dumpbin` on Windows or `objdump` on Linux;
+portable header inspection uses Python 3:
+
+```bash
+python3 scripts/check-windows-pe.py --self-test
+python3 scripts/check-windows-pe.py --cli /path/to/kvr.exe --gui /path/to/kvr-gui.exe
+```
+
+On native Windows packaging also executes the extracted CLI's `--help` and
+`--version`. CI and artifact-only manual release builds use this packaging
+path. Editing a workflow is not evidence of a passed Windows build: execution
+of the repaired Windows jobs and native GUI/WASAPI behavior remain pending
+until run on Windows. Header-only test fixtures are not runnable artifacts.
 
 To verify the archive on a Windows machine:
 
@@ -348,6 +383,27 @@ The expected `kvr --version` output is `kvr 0.1.1` and the hash
 must match the value in the sidecar / `SHA256SUMS`.
 
 </details>
+
+### Later native Windows acceptance
+
+- Extract a newly built ZIP. Launch the GUI from Explorer: no console or
+  flash; inspect idle rendering, microphone selection, and device refresh.
+  Confirm the CLI still opens/uses a console.
+- Record a known sound with the default microphone and an explicitly selected
+  device. A/B against another recorder with the same device/routing/mute settings.
+  Check live level, increasing file size, capture diagnostics, and full destination.
+  Quiet audio alone does not establish an application defect.
+- Exercise Pause/Resume/Stop, native save dialog, repeated collision names,
+  and closing during a take; verify paused time/audio is excluded and output finalized.
+- Disconnect the selected device during a take and while paused: a useful backend
+  error should appear, without SAVED, and any partial recording should be parseable.
+- Launch from another working directory and a read-only installation folder.
+  Defaults must remain in the displayed writable user directory.
+- Decode Opus/WAV/raw with ffmpeg; listen/check nonzero samples for the known sound.
+  Verify rate, channels, decoded duration, Ogg EOS/CRC/granules or WAV size metadata,
+  including a 44.1 kHz-only device if available. Raw needs the displayed capture
+  rate/channel configuration supplied to the decoder.
+
 
 ## License and documentation
 

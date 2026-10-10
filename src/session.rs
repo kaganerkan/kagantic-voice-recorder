@@ -111,7 +111,8 @@ pub fn output_path_for(dir: &Path, ext: &str) -> PathBuf {
 /// `-3`, … suffix until one is free. Used by both the CLI and the GUI so
 /// the recorder never silently overwrites an existing take.
 pub fn next_available_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let candidate = dir.join(format!("{stem}.{ext}"));
+    let dot = if ext.is_empty() { "" } else { "." };
+    let candidate = dir.join(format!("{stem}{dot}{ext}"));
     if !candidate.exists() {
         return candidate;
     }
@@ -120,15 +121,14 @@ pub fn next_available_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     // not "skip `-1` and use `-2`").
     let mut suffix: u32 = 1;
     loop {
-        let candidate = dir.join(format!("{stem}-{suffix}.{ext}"));
+        let candidate = dir.join(format!("{stem}-{suffix}{dot}{ext}"));
         if !candidate.exists() {
             return candidate;
         }
         suffix = match suffix.checked_add(1) {
             Some(next) => next,
-            // Pathological: more than u32::MAX collisions. Fall back to the
-            // last valid path so the recorder still writes *some* file.
-            None => return dir.join(format!("{stem}-{suffix}.{ext}")),
+            // Exclusive sink creation will reject this remaining collision.
+            None => return dir.join(format!("{stem}-{suffix}{dot}{ext}")),
         };
     }
 }

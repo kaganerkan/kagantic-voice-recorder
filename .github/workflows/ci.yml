@@ -143,6 +143,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Test portable Windows PE checks
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          subprocess.run([sys.executable, "scripts/check-windows-pe.py", "--self-test"], check=True)
+
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 

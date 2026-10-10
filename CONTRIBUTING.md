@@ -22,6 +22,7 @@ artifacts.
 - **`ffmpeg` and `ffprobe` on `PATH`** — required by the integration tests
   and for verifying recordings. The tests are the only thing that needs
   them; the app itself does not.
+- **Python 3** — packaging-time PE inspection and its fixture tests (not an app runtime dependency).
 - **No microphone or display required** for the test suite (see
   [Tests](#tests)).
 
@@ -49,14 +50,16 @@ and pull request, which also performs a full `cargo build --locked
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 scripts/check-windows-pe.py --self-test
 ```
 
-There is no additional formatter, pre-commit hook, or linter gate beyond
-these three; keep code `rustfmt`-clean and warning-free.
+The three Rust gates are supplemented by the portable PE fixture check in
+both CI workflows. There is no additional formatter or pre-commit hook;
+keep code `rustfmt`-clean and warning-free.
 
 ## Tests
 
-All test audio is **synthesized** (a 1 kHz sine wave), so the suite is safe,
+All test audio is **synthesized** (single tones or separate stereo tones), so the suite is safe,
 deterministic, and needs no microphone, audio server, or window display:
 
 | Test | What it checks |
@@ -66,13 +69,16 @@ deterministic, and needs no microphone, audio server, or window display:
 | `tests/raw.rs` | raw `f32` little-endian round-trip: `--format raw` writes headerless samples; every frame survives a bit-exact read-back through `python3 -c 'import sys, struct; …'` |
 | `tests/no_gaps.rs` | strictly increasing granule positions under simulated CPU contention |
 | `tests/no_gaps_under_jitter.rs` | no dropped or duplicated frames when the pipeline stalls |
-| unit tests in `src/bin/gui.rs` | paused level-history freezes and resumes without a gap (headless `egui` context — no display needed) |
+| `tests/recording_pipeline.rs` | production drain/sinks at 44.1 kHz stereo with irregular callbacks and partial tail; live/final byte counts equal file length; ffmpeg verifies decoded frame count, nonzero channel-specific tones, bit-exact raw; ffprobe validates rate/channels/duration; Ogg framing, CRC, EOS and granule checked; existing output never truncated |
+| unit tests in `src/audio.rs` / `src/output.rs` | supported 44.1 kHz configurations, unsupported/hinted channel errors, callback/error diagnostics, continuous-phase channel-safe resampling |
+| unit tests in `src/lib.rs` / `src/writers.rs` | CLI destination resolution/collisions preserve existing takes, native directory respected, headerless empty WAV and classic RIFF limit boundary without allocating a 4 GiB file |
+| `scripts/check-windows-pe.py --self-test` | header-only fixtures accept GUI Subsystem 2 / CLI Subsystem 3 and reject swapped subsystems, wrong architecture, malformed/truncated PE headers; fixtures are not runtime artifacts |
+| unit tests in `src/bin/gui.rs` | mocked production workers verify live/final size and ffmpeg decoded nonzero samples/duration; absent callbacks/valid silence, late backend failure while paused and valid partial WAV; writable output fallback and GUI saved/error states; format/extension precedence; multi-frame egui keyboard editing and paused level history |
 | unit tests in `src/session.rs` (Windows) | real-process liveness: own PID, running child, and completed child; the helper child is always killed and reaped |
 
 Practical notes:
 
-- The three integration tests shell out to `ffprobe` (and `ffmpeg` for
-  `end_to_end.rs`) — both must be on `PATH`.
+- Integration tests shell out to `ffprobe` / `ffmpeg`; both must be on `PATH`.
 - Integration tests use unique temporary directories under the operating
   system's temporary-file location and remove them automatically. No
   `/tmp` or `C:\tmp` setup is required.
@@ -127,9 +133,16 @@ ffmpeg -i recording.opus -f wav out.wav
 
   They enforce the version match, the single-root archive layout, the
   binary smoke test, and checksum verification, and never overwrite an
-  existing archive. Windows packaging additionally rejects Visual C++ runtime
-  DLL imports in both binaries, using Visual Studio's `dumpbin` on Windows or
-  binutils' `objdump` on Linux. Keep `.cargo/config.toml` and
-  `.cargo/msvc-runtime.cmake` enabled: Rust and bundled libopus must both use
-  the static MSVC runtime. Runner smoke tests alone cannot detect this
-  regression because the runner already has the redistributable installed.
+  existing archive. Windows packaging requires Python 3 to inspect both original
+  and extracted ZIP binaries: x86-64 PE32+, GUI Subsystem 2, CLI Subsystem 3.
+  It also rejects Visual C++ runtime DLL imports in both sets, using Visual
+  Studio's `dumpbin` on Windows or binutils' `objdump` on Linux. Native packaging
+  smoke-tests the extracted CLI; cross-packaging explicitly skips runtime execution.
+  ZIP entries are written explicitly with forward-slash paths, including on
+  Windows PowerShell 5.1; `Compress-Archive` can otherwise emit backslash names
+  that violate the canonical archive-layout check.
+  Keep `.cargo/config.toml` and `.cargo/msvc-runtime.cmake` enabled: Rust and
+  bundled libopus must both use the static MSVC runtime. Runner smoke tests alone
+  cannot detect dynamic-runtime regressions because the runner has the redistributable.
+  CI workflow edits do not establish that a Windows job passed; use an authorized
+  non-publishing CI/artifact build and the README's native acceptance checklist.

@@ -5,23 +5,6 @@ use anyhow::{anyhow, Result};
 
 use crate::audio::CaptureFormat;
 
-fn sample_rate_from_u32(rate: u32) -> Result<SampleRate> {
-    Ok(match rate {
-        8_000 => SampleRate::Hz8000,
-        12_000 => SampleRate::Hz12000,
-        16_000 => SampleRate::Hz16000,
-        24_000 => SampleRate::Hz24000,
-        48_000 => SampleRate::Hz48000,
-        // libopus only supports the discrete rates above at the API surface.
-        // Internally it always resamples to 48 kHz; we accept the closest
-        // supported rate and document it via the OpusHead input_sample_rate.
-        r if r < 16_000 => SampleRate::Hz12000,
-        r if r < 24_000 => SampleRate::Hz16000,
-        r if r < 48_000 => SampleRate::Hz24000,
-        _ => SampleRate::Hz48000,
-    })
-}
-
 /// Build the OpusHead identification packet (RFC 7845 §5.1).
 pub fn build_opus_head(fmt: &CaptureFormat, pre_skip: u16) -> Vec<u8> {
     let mut v = Vec::with_capacity(19);
@@ -65,7 +48,7 @@ impl OpusStreamEncoder {
             2 => Channels::Stereo,
             n => return Err(anyhow!("unsupported channel count: {n}")),
         };
-        let rate = sample_rate_from_u32(fmt.sample_rate)?;
+        let rate = SampleRate::Hz48000;
         let mut enc = Encoder::new(channels, rate, Application::Audio)
             .map_err(|e| anyhow!("opus encoder init: {e:?}"))?;
         enc.set_bitrate(Bitrate::from(bitrate_bps))
@@ -73,7 +56,7 @@ impl OpusStreamEncoder {
         Ok(Self {
             enc,
             channels: fmt.channels,
-            sample_rate: fmt.sample_rate,
+            sample_rate: 48_000,
             frame_size: 960,
         })
     }
@@ -109,7 +92,7 @@ impl OpusStreamEncoder {
     }
 }
 
-/// RFC 7845 mandates pre-skip = 312 samples at 48 kHz (≈6.5ms) for libopus.
+/// Encoder lookahead for the fixed 48 kHz audio mode, in granule samples.
 pub fn pre_skip_samples() -> u16 {
     312
 }

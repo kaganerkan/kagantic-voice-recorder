@@ -53,11 +53,11 @@ enum Cmd {
         #[arg(short, long, default_value_t = 96_000)]
         bitrate: i32,
 
-        /// Force a channel count (1 or 2). Default: device default.
+        /// Require a supported channel count (1 or 2). Default: prefer mono.
         #[arg(long)]
         channels: Option<u8>,
 
-        /// Force a sample rate. Default: device default.
+        /// Require the negotiated capture rate; mismatch is an error. Default: prefer supported 48 kHz.
         #[arg(long)]
         sample_rate: Option<u32>,
 
@@ -170,7 +170,7 @@ async fn cmd_start(
         }
     }
 
-    let cfg = RunConfig {
+    let mut cfg = RunConfig {
         output: output.clone(),
         bitrate_bps: bitrate,
         force_channels: channels,
@@ -183,6 +183,8 @@ async fn cmd_start(
     // default inside `dir` using the format's default extension, or the
     // `--extension` override if provided).
     let out = resolve_output(&cfg, &dir);
+    // The session, display and worker must use the same collision-safe path.
+    cfg.output = Some(out.clone());
 
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Control>(8);
     let stop_notify = Arc::new(Notify::new());

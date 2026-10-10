@@ -1,6 +1,9 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! Native audio recorder built with eframe/egui and the glow renderer.
 //! Audio capture and encoding run on a worker thread; closing the window
 //! stops and joins that worker after the current take has been finalized.
+//! Hardware-free worker regression tests decode synthetic output with ffmpeg.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -11,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke};
-use kvr_recorder::audio::{discard_partial_blocking, start_capture_named, try_take_frame_blocking};
+use kvr_recorder::audio::{
+    discard_partial_blocking, start_capture_named, Accum, CaptureDiagnostics, CaptureFormat,
+    CaptureSnapshot,
+};
 use kvr_recorder::devices::input_devices;
-use kvr_recorder::encoder::OpusStreamEncoder;
 use kvr_recorder::output::OutputFormat;
 use kvr_recorder::session::resolve_recording_path;
-use kvr_recorder::writers::{FrameSink, OggOpusSink, RawF32Sink, WavSink};
+use kvr_recorder::writers::{drain_capture, open_sink};
 
 const NAVY: Color32 = Color32::from_rgb(26, 39, 68);
 const BLUE: Color32 = Color32::from_rgb(74, 111, 165);
@@ -68,8 +73,10 @@ enum RecorderMsg {
     },
     Finished {
         path: PathBuf,
+        bytes: u64,
     },
     Error(String),
+    Diagnostic(String),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,17 +104,9 @@ struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // The displayed field is a *placeholder stem*, not the final filename.
-        // The actual recording name (`<home>/<YYYYMMDD-HHMMSS>.<ext>` or the
-        // user-typed stem) is resolved at the moment the user presses RECORD
-        // (see `start_recording`), so two consecutive presses always produce
-        // two unique takes even within the same second.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let ext = OutputFormat::Opus.default_ext();
-        let placeholder = std::path::Path::new(&home)
-            .join(format!("recording.{ext}"))
-            .to_string_lossy()
-            .into_owned();
+        let placeholder = default_recording_directory()
+            .map(|dir| dir.join("recording.opus").to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
             selected_device: None,
             output_path: placeholder,
@@ -124,7 +123,7 @@ impl AppConfig {
     fn effective_ext(&self) -> &str {
         match &self.extension {
             Some(ext) if !ext.is_empty() => ext.as_str(),
-            _ => self.format.default_ext(),
+            _ => self.output_format().default_ext(),
         }
     }
 
@@ -146,6 +145,135 @@ impl AppConfig {
         }
         self.format
     }
+
+    fn select_format(&mut self, format: OutputFormat) {
+        self.format = format;
+        if self
+            .extension
+            .as_deref()
+            .is_some_and(|ext| ext.parse::<OutputFormat>().is_ok())
+        {
+            self.extension = None;
+        }
+        let mut path = PathBuf::from(&self.output_path);
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.parse::<OutputFormat>().is_ok())
+        {
+            path.set_extension(format.default_ext());
+            self.output_path = path.to_string_lossy().into_owned();
+        }
+    }
+
+    fn edit_extension(&mut self, text: String, commit: bool) {
+        self.extension = if commit {
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        } else {
+            // Keep even the empty in-progress buffer across repaint frames.
+            Some(text)
+        };
+    }
+}
+
+fn choose_writable_directory(candidates: &[PathBuf]) -> Result<PathBuf> {
+    let mut errors = Vec::new();
+    for directory in candidates.iter().filter(|path| path.is_absolute()) {
+        let attempt = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(directory)?;
+            let probe = directory.join(format!(
+                ".kvr-write-probe-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let file = std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&probe)?;
+            drop(file);
+            std::fs::remove_file(probe)
+        })();
+        match attempt {
+            Ok(()) => return Ok(directory.clone()),
+            Err(error) => errors.push(format!("{}: {error}", directory.display())),
+        }
+    }
+    anyhow::bail!(
+        "no writable user recording directory; choose an output path. {}",
+        errors.join("; ")
+    )
+}
+
+fn default_recording_directory() -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(user) = directories::UserDirs::new() {
+        if let Some(audio) = user.audio_dir() {
+            candidates.push(audio.join("Kagantic Voice Recorder"));
+        }
+    }
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(
+            base.data_local_dir()
+                .join("Kagantic Voice Recorder")
+                .join("Recordings"),
+        );
+        candidates.push(
+            base.home_dir()
+                .join("Kagantic Voice Recorder")
+                .join("Recordings"),
+        );
+    }
+    // Last resort is explicit and independent of the installation/cwd.
+    candidates.push(std::env::temp_dir().join(format!("kvr-recordings-{}", std::process::id())));
+    choose_writable_directory(&candidates)
+}
+
+fn initialize_logging() -> Result<PathBuf> {
+    let directory = directories::BaseDirs::new()
+        .map(|base| {
+            base.data_local_dir()
+                .join("Kagantic Voice Recorder")
+                .join("Logs")
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("kvr-logs-{}", std::process::id())));
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("gui.log");
+    let file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initialize GUI log: {error}"))?;
+    Ok(path)
+}
+
+fn capture_diagnostic(current: CaptureSnapshot, previous: CaptureSnapshot, paused: bool) -> String {
+    let input = if current.callbacks == previous.callbacks || current.samples == previous.samples {
+        "Waiting for input callbacks / no new samples received."
+    } else if current.nonzero_samples == previous.nonzero_samples {
+        "Input callbacks active / all-zero samples (silence is valid)."
+    } else {
+        "Input callbacks active / nonzero samples received."
+    };
+    if paused {
+        format!("{input} Paused / captured input is discarded.")
+    } else {
+        input.into()
+    }
 }
 
 struct App {
@@ -156,6 +284,8 @@ struct App {
     status: String,
     error: Option<String>,
     device_error: Option<String>,
+    capture_note: String,
+    log_note: String,
     saved_path: Option<PathBuf>,
     /// Filename the worker actually opened for the current take. Populated
     /// from the `Started { path }` message and shown in the status panel.
@@ -432,6 +562,8 @@ impl App {
             status: "Choose an input and press Record to begin.".into(),
             error: None,
             device_error: None,
+            capture_note: String::new(),
+            log_note: String::new(),
             saved_path: None,
             last_resolved: None,
             input_devices: Vec::new(),
@@ -502,6 +634,17 @@ impl App {
         // the same second still produce two unique takes. User-typed stems
         // are preserved verbatim (with `-2`, `-3`, … appended on collision).
         let typed = PathBuf::from(&self.cfg.output_path);
+        let typed = if typed.is_absolute() {
+            typed
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(typed),
+                Err(error) => {
+                    self.error = Some(format!("Resolve output directory: {error}"));
+                    return;
+                }
+            }
+        };
         let ext = self.cfg.effective_ext().to_string();
         // Resolve the actual filename at the moment the user presses RECORD.
         // The field shown in the UI is a *placeholder stem* (default
@@ -516,6 +659,15 @@ impl App {
         // as user input and start suffixing instead of producing a fresh
         // timestamp.
         let output = resolve_recording_path(&typed, &ext);
+        if let Some(parent) = output.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.error = Some(format!(
+                    "Create output directory {}: {error}",
+                    parent.display()
+                ));
+                return;
+            }
+        }
         let bitrate = self.cfg.bitrate_kbps * 1000;
         let format = self.cfg.output_format();
         let extension = self.cfg.extension.clone();
@@ -532,6 +684,7 @@ impl App {
                     cmd_rx,
                     &msg_tx,
                 ) {
+                    tracing::error!("recording failed: {error:#}");
                     let _ = msg_tx.send(RecorderMsg::Error(format!("{error:#}")));
                 }
                 repaint.request_repaint();
@@ -546,6 +699,7 @@ impl App {
                 self.saved_path = None;
                 self.last_resolved = None;
                 self.error = None;
+                self.capture_note.clear();
                 self.status = "Connecting to the microphone...".into();
             }
             Err(error) => {
@@ -630,10 +784,12 @@ impl App {
                         self.level_history.push_back(progress.level);
                     }
                 }
-                Ok(RecorderMsg::Finished { path }) => {
+                Ok(RecorderMsg::Diagnostic(note)) => self.capture_note = note,
+                Ok(RecorderMsg::Finished { path, bytes }) => {
                     if self.join_worker() {
                         self.state = State::Stopped;
                         self.last_progress.level = 0.0;
+                        self.last_progress.bytes = bytes;
                         self.saved_path = Some(path);
                         self.status = "Recording saved. Your file is ready.".into();
                     } else {
@@ -763,7 +919,7 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
-                    "{:.1} KB encoded audio",
+                    "{:.1} KiB file size / includes container headers",
                     self.last_progress.bytes as f64 / 1024.0
                 ));
                 ui.label(
@@ -1009,64 +1165,45 @@ impl App {
                 &self.folder_icon,
             );
             ui.add_enabled_ui(!self.state.is_busy(), |ui| {
-                // Format dropdown. Detect a change so the extension field can
-                // snap to the new default (when the user hasn't typed a
-                // custom value yet).
-                let previous_default = self.cfg.format.default_ext().to_string();
+                let mut selected_format = self.cfg.output_format();
                 ui.horizontal(|ui| {
                     ui.label("FORMAT");
                     egui::ComboBox::from_id_salt("output_format")
-                        .selected_text(format_label(self.cfg.format))
+                        .selected_text(format_label(selected_format))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut self.cfg.format,
+                                &mut selected_format,
                                 OutputFormat::Opus,
                                 format_label(OutputFormat::Opus),
                             );
                             ui.selectable_value(
-                                &mut self.cfg.format,
+                                &mut selected_format,
                                 OutputFormat::WavPcm16le,
                                 format_label(OutputFormat::WavPcm16le),
                             );
                             ui.selectable_value(
-                                &mut self.cfg.format,
+                                &mut selected_format,
                                 OutputFormat::RawF32le,
                                 format_label(OutputFormat::RawF32le),
                             );
                         });
                 });
 
-                // Extension override (auto-tracks the format default if blank
-                // or matching the previous default).
-                let current_default = self.cfg.format.default_ext().to_string();
-                // When the dropdown moved to a new format and the user hasn't
-                // typed a custom override, snap the extension to the new
-                // format's default.
-                if current_default != previous_default
-                    && self.cfg.extension.as_deref() == Some(previous_default.as_str())
-                {
-                    self.cfg.extension = None;
+                if selected_format != self.cfg.output_format() {
+                    self.cfg.select_format(selected_format);
                 }
-                let ext_text = self
-                    .cfg
-                    .extension
-                    .clone()
-                    .unwrap_or_else(|| current_default.clone());
-                let mut ext_buffer = ext_text.clone();
+                let mut ext_buffer = self.cfg.extension.clone()
+                    .unwrap_or_else(|| self.cfg.effective_ext().to_string());
                 ui.horizontal(|ui| {
                     ui.label("EXTENSION");
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut ext_buffer)
+                            .id(egui::Id::new("extension_override"))
                             .font(egui::TextStyle::Monospace)
                             .desired_width(120.0),
                     );
-                    if response.lost_focus() {
-                        let trimmed = ext_buffer.trim().to_string();
-                        self.cfg.extension = if trimmed.is_empty() || trimmed == current_default {
-                            None
-                        } else {
-                            Some(trimmed)
-                        };
+                    if response.changed() || response.lost_focus() {
+                        self.cfg.edit_extension(ext_buffer, response.lost_focus());
                     }
                 });
 
@@ -1156,6 +1293,20 @@ impl App {
             ui.add(egui::Label::new(&self.status).wrap());
             if let Some(error) = &self.error {
                 ui.add(egui::Label::new(RichText::new(error).color(NAVY)).wrap());
+            }
+            if !self.capture_note.is_empty() {
+                ui.add(egui::Label::new(&self.capture_note).wrap());
+            }
+            if !self.log_note.is_empty() {
+                ui.add(egui::Label::new(&self.log_note).wrap());
+            }
+            if let Some(path) = &self.last_resolved {
+                ui.label(
+                    RichText::new("DESTINATION")
+                        .font(display_font(11.0))
+                        .color(BLUE),
+                );
+                ui.add(egui::Label::new(RichText::new(path.to_string_lossy()).monospace()).wrap());
             }
             if let Some(path) = &self.saved_path {
                 ui.label(
@@ -1273,71 +1424,50 @@ fn run_worker(
     msg_tx: &Sender<RecorderMsg>,
 ) -> Result<()> {
     let (capture, accum) = start_capture_named(device_name.as_deref(), 0)?;
-    let capture_fmt = capture.format.clone();
-    let mut capture = Some(capture);
+    let fmt = capture.format.clone();
+    let diagnostics = capture.diagnostics.clone();
+    run_worker_with_capture(
+        fmt,
+        accum,
+        diagnostics,
+        move || drop(capture),
+        output,
+        bitrate,
+        format,
+        cmd_rx,
+        msg_tx,
+    )
+}
 
-    // Build the writer based on the chosen format. The Opus path keeps the
-    // pre-existing behaviour (encoder + OggWriter) and is wrapped in the
-    // shared `OggOpusSink`; the WAV and raw paths pull from the accumulator
-    // directly.
-    enum SinkMode {
-        Opus {
-            run: Box<dyn FrameSink + Send>,
-            encoder: OpusStreamEncoder,
-        },
-        Pcm {
-            run: Box<dyn FrameSink + Send>,
-            block_samples: usize,
-            channels: usize,
-        },
-    }
-    let mut mode = match format {
-        OutputFormat::Opus => {
-            let mut ogg_sink = OggOpusSink::new_file(&output, &capture_fmt, bitrate)?;
-            let encoder = OpusStreamEncoder::new(&capture_fmt, bitrate)?;
-            ogg_sink.write_header(&capture_fmt)?;
-            SinkMode::Opus {
-                run: Box::new(ogg_sink),
-                encoder,
-            }
-        }
-        OutputFormat::WavPcm16le => {
-            let mut wav = WavSink::new_file(&output, &capture_fmt)?;
-            wav.write_header(&capture_fmt)?;
-            SinkMode::Pcm {
-                run: Box::new(wav),
-                block_samples: 480,
-                channels: capture_fmt.channels as usize,
-            }
-        }
-        OutputFormat::RawF32le => {
-            let mut raw = RawF32Sink::new_file(&output, &capture_fmt)?;
-            raw.write_header(&capture_fmt)?;
-            SinkMode::Pcm {
-                run: Box::new(raw),
-                block_samples: 480,
-                channels: capture_fmt.channels as usize,
-            }
-        }
-    };
-
-    // The output file is now open; tell the GUI the actual filename so it
-    // can update the visible field (and so a same-second click produces a
-    // distinct, user-visible name).
+#[allow(clippy::too_many_arguments)]
+fn run_worker_with_capture(
+    fmt: CaptureFormat,
+    accum: Accum,
+    diagnostics: CaptureDiagnostics,
+    stop_capture: impl FnOnce(),
+    output: PathBuf,
+    bitrate: i32,
+    format: OutputFormat,
+    cmd_rx: Receiver<WorkerCmd>,
+    msg_tx: &Sender<RecorderMsg>,
+) -> Result<()> {
+    let mut stop_capture = Some(stop_capture);
+    let mut sink = open_sink(&output, &fmt, format, bitrate)?;
     let _ = msg_tx.send(RecorderMsg::Started {
         path: output.clone(),
     });
-
     let _ = msg_tx.send(RecorderMsg::Ready);
-
     let mut paused = false;
-    let mut stopping = false;
-    let mut frames = 0u64;
-    let mut level_sum = 0.0f32;
-    let mut level_samples = 0usize;
+    let mut samples = 0u64;
+    let mut level_sum = 0.0;
+    let mut level_samples = 0u64;
+    let mut buffer = Vec::with_capacity(fmt.sample_rate as usize / 100 * usize::from(fmt.channels));
     let mut last_progress = Instant::now();
-
+    let mut last_diagnostic = Instant::now();
+    let mut previous = CaptureSnapshot::default();
+    let mut backend_error = None;
     loop {
+        let mut stopping = false;
         loop {
             match cmd_rx.try_recv() {
                 Ok(WorkerCmd::Pause) => {
@@ -1357,103 +1487,75 @@ fn run_worker(
                 Err(TryRecvError::Empty) => break,
             }
         }
-
+        if let Some(error) = diagnostics.take_error() {
+            backend_error = Some(error);
+            stopping = true;
+        }
         if stopping {
-            // Stop callbacks before draining the remaining complete frames.
-            // Paused input is discarded, never appended to the saved take.
-            drop(capture.take());
+            if let Some(stop) = stop_capture.take() {
+                stop();
+            }
         }
         if paused {
             discard_partial_blocking(&accum);
         } else {
-            match &mut mode {
-                SinkMode::Opus { run, encoder } => {
-                    while let Some(frame) = try_take_frame_blocking(&accum, encoder) {
-                        // Measure real samples before encoding consumes the
-                        // frame, rather than inspecting an already-drained
-                        // accumulator.
-                        level_sum += frame.iter().map(|s| s * s).sum::<f32>();
-                        level_samples += frame.len();
-                        run.write_frames(&frame, &capture_fmt)?;
-                        frames += 1;
-                    }
-                }
-                SinkMode::Pcm {
-                    run,
-                    block_samples,
-                    channels,
-                } => {
-                    let block_samples = *block_samples;
-                    let channels = *channels;
-                    let need = block_samples * channels;
-                    loop {
-                        let drained = {
-                            let mut buf = accum.lock();
-                            if buf.len() < need {
-                                None
-                            } else {
-                                Some(buf.drain(..need).collect::<Vec<f32>>())
-                            }
-                        };
-                        let Some(block) = drained else { break };
-                        let resampled = if capture_fmt.sample_rate == 48_000 {
-                            block
-                        } else {
-                            kvr_recorder::output::resample_linear(
-                                &block,
-                                capture_fmt.sample_rate,
-                                48_000,
-                            )
-                        };
-                        level_sum += resampled.iter().map(|s| s * s).sum::<f32>();
-                        level_samples += resampled.len();
-                        run.write_frames(&resampled, &capture_fmt)?;
-                        frames += 1;
-                    }
-                }
-            }
+            let (count, squares) =
+                drain_capture(&accum, sink.as_mut(), &fmt, stopping, &mut buffer)?;
+            samples += count;
+            level_samples += count;
+            level_sum += squares;
         }
-
+        if stopping {
+            sink.finalize()?;
+        }
         if stopping || last_progress.elapsed() >= Duration::from_millis(80) {
             let level = if level_samples == 0 {
                 0.0
             } else {
-                (level_sum / level_samples as f32).sqrt().clamp(0.0, 1.0)
-            };
-            // The Opus path exposes the encoder's frame size + sample rate;
-            // PCM paths use 10ms blocks at the negotiated capture rate.
-            let elapsed_ms = match &mode {
-                SinkMode::Opus { encoder, .. } => {
-                    frames * encoder.frame_size() as u64 * 1000
-                        / u64::from(encoder.sample_rate()).max(1)
-                }
-                SinkMode::Pcm { .. } => {
-                    frames * 480 * 1000 / u64::from(capture_fmt.sample_rate).max(1)
-                }
+                (level_sum / level_samples as f64).sqrt().clamp(0.0, 1.0) as f32
             };
             let _ = msg_tx.send(RecorderMsg::Progress(ProgressUpdate {
-                elapsed_ms,
-                bytes: 0,
+                elapsed_ms: samples * 1000 / u64::from(fmt.channels) / u64::from(fmt.sample_rate),
+                bytes: sink.bytes_written(),
                 level,
                 paused,
             }));
-            level_sum = 0.0;
             level_samples = 0;
+            level_sum = 0.0;
             last_progress = Instant::now();
         }
+        if stopping || last_diagnostic.elapsed() >= Duration::from_secs(1) {
+            let current = diagnostics.snapshot();
+            let note = capture_diagnostic(current, previous, paused);
+            tracing::info!(
+                callbacks = current.callbacks,
+                samples = current.samples,
+                nonzero_samples = current.nonzero_samples,
+                "{note}"
+            );
+            let output_rate = if format == OutputFormat::Opus {
+                48_000
+            } else {
+                fmt.sample_rate
+            };
+            let _ = msg_tx.send(RecorderMsg::Diagnostic(format!(
+                "Input: {} ch @ {} Hz / output: {} Hz. {note}",
+                fmt.channels, fmt.sample_rate, output_rate
+            )));
+            previous = current;
+            last_diagnostic = Instant::now();
+        }
         if stopping {
-            // Finalize the sink before dropping it so WAV / raw files get
-            // their size headers back-patched and the Opus sink emits its
-            // EOS page.
-            match &mut mode {
-                SinkMode::Opus { run, .. } => {
-                    run.finalize()?;
-                }
-                SinkMode::Pcm { run, .. } => {
-                    run.finalize()?;
-                }
+            if let Some(error) = backend_error.or_else(|| diagnostics.take_error()) {
+                anyhow::bail!(
+                    "capture backend failed: {error}; partial recording finalized at {}",
+                    output.display()
+                );
             }
-            let _ = msg_tx.send(RecorderMsg::Finished { path: output });
+            let _ = msg_tx.send(RecorderMsg::Finished {
+                path: output,
+                bytes: sink.bytes_written(),
+            });
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -1461,7 +1563,11 @@ fn run_worker(
 }
 
 fn main() -> eframe::Result<()> {
-    eframe::run_native(
+    let log_note = match initialize_logging() {
+        Ok(path) => format!("Local diagnostics: {}", path.display()),
+        Err(error) => format!("Local diagnostics unavailable: {error:#}"),
+    };
+    let result = eframe::run_native(
         "Kagantic Voice Recorder",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -1470,28 +1576,47 @@ fn main() -> eframe::Result<()> {
                 .with_resizable(true),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+        Box::new(move |cc| {
+            let mut app = App::new(cc);
+            app.log_note = log_note;
+            if app.cfg.output_path.is_empty() {
+                app.error = Some(
+                    "No writable default output directory. Choose a destination before recording."
+                        .into(),
+                );
+            }
+            Ok(Box::new(app))
+        }),
+    );
+    if let Err(error) = &result {
+        tracing::error!("GUI startup/runtime failed: {error}");
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn level_history_freezes_during_pause_and_resumes_without_a_gap() {
-        let (tx, rx) = mpsc::channel();
-        let history: VecDeque<f32> = (0..HISTORY_SAMPLES)
-            .map(|index| index as f32 / HISTORY_SAMPLES as f32)
-            .collect();
-        let mut app = App {
-            state: State::Paused,
-            cfg: AppConfig::default(),
+    fn headless_app(rx: Receiver<RecorderMsg>) -> App {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        App {
+            state: State::Idle,
+            cfg: AppConfig {
+                selected_device: None,
+                output_path: String::new(),
+                bitrate_kbps: 96,
+                format: OutputFormat::Opus,
+                extension: None,
+            },
             last_progress: ProgressUpdate::default(),
-            level_history: history.clone(),
+            level_history: VecDeque::new(),
             status: String::new(),
             error: None,
             device_error: None,
+            capture_note: String::new(),
+            log_note: String::new(),
             saved_path: None,
             last_resolved: None,
             input_devices: Vec::new(),
@@ -1500,20 +1625,31 @@ mod tests {
             worker: None,
             closing: false,
             startup_repaints: 0,
-            logo: load_logo(&egui::Context::default()),
+            logo: load_logo(&ctx),
             microphone_icon: load_asset(
-                &egui::Context::default(),
+                &ctx,
                 "microphone",
                 include_bytes!("../../assets/icons/microphone.png"),
                 egui::TextureOptions::LINEAR,
             ),
             folder_icon: load_asset(
-                &egui::Context::default(),
+                &ctx,
                 "folder",
                 include_bytes!("../../assets/icons/folder.png"),
                 egui::TextureOptions::LINEAR,
             ),
-        };
+        }
+    }
+
+    #[test]
+    fn level_history_freezes_during_pause_and_resumes_without_a_gap() {
+        let (tx, rx) = mpsc::channel();
+        let history: VecDeque<f32> = (0..HISTORY_SAMPLES)
+            .map(|index| index as f32 / HISTORY_SAMPLES as f32)
+            .collect();
+        let mut app = headless_app(rx);
+        app.state = State::Paused;
+        app.level_history = history.clone();
 
         // Both an in-flight recording update and paused heartbeats must leave
         // every bar in place after the user presses Pause.
@@ -1550,5 +1686,442 @@ mod tests {
         expected.pop_front();
         expected.push_back(0.75);
         assert_eq!(app.level_history, expected);
+    }
+
+    #[test]
+    fn writable_destination_selection_skips_invalid_candidates_without_cwd_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"keep").unwrap();
+        let writable = dir.path().join("user-data").join("Recordings");
+        let selected = choose_writable_directory(&[
+            PathBuf::from("relative"),
+            blocked.clone(),
+            writable.clone(),
+        ])
+        .unwrap();
+        assert_eq!(selected, writable);
+        assert!(selected.is_absolute());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"keep");
+        assert!(choose_writable_directory(&[PathBuf::from("relative"), blocked]).is_err());
+    }
+
+    #[test]
+    fn final_size_and_capture_failure_have_distinct_gui_states() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = headless_app(rx);
+        let path = PathBuf::from("take.wav");
+        tx.send(RecorderMsg::Started { path: path.clone() })
+            .unwrap();
+        tx.send(RecorderMsg::Diagnostic("all-zero samples / silence".into()))
+            .unwrap();
+        tx.send(RecorderMsg::Finished {
+            path: path.clone(),
+            bytes: 1234,
+        })
+        .unwrap();
+        app.receive_messages();
+        assert_eq!(app.state, State::Stopped);
+        assert_eq!(app.last_progress.bytes, 1234);
+        assert_eq!(app.saved_path, Some(path.clone()));
+        assert_eq!(app.last_resolved, Some(path));
+        assert!(app.error.is_none());
+
+        let (tx, rx) = mpsc::channel();
+        app.msg_rx = Some(rx);
+        app.saved_path = None;
+        app.state = State::Recording;
+        tx.send(RecorderMsg::Error(
+            "device disconnected; partial take finalized".into(),
+        ))
+        .unwrap();
+        app.receive_messages();
+        assert_eq!(app.state, State::Idle);
+        assert!(app.saved_path.is_none());
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("device disconnected"));
+    }
+
+    #[test]
+    fn worker_mock_capture_reports_live_and_final_actual_bytes_for_all_formats() {
+        for format in [
+            OutputFormat::Opus,
+            OutputFormat::WavPcm16le,
+            OutputFormat::RawF32le,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join(format!("take.{}", format.default_ext()));
+            let fmt = CaptureFormat {
+                sample_rate: 44_100,
+                channels: 2,
+            };
+            let samples: Vec<f32> = (0..22_050)
+                .flat_map(|index| {
+                    let value =
+                        0.25 * (index as f32 * std::f32::consts::TAU * 440.0 / 44_100.0).sin();
+                    [value, -value]
+                })
+                .collect();
+            let accum = std::sync::Arc::new(parking_lot::Mutex::new(samples.clone()));
+            let diagnostics = CaptureDiagnostics::default();
+            diagnostics.record_samples(&samples);
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (msg_tx, msg_rx) = mpsc::channel();
+            let path = output.clone();
+            let worker = std::thread::spawn(move || {
+                run_worker_with_capture(
+                    fmt,
+                    accum,
+                    diagnostics,
+                    || {},
+                    path,
+                    96_000,
+                    format,
+                    cmd_rx,
+                    &msg_tx,
+                )
+            });
+            let live = loop {
+                match msg_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    RecorderMsg::Progress(update) => break update,
+                    RecorderMsg::Error(error) => panic!("{error}"),
+                    _ => {}
+                }
+            };
+            assert_eq!(live.elapsed_ms, 500);
+            assert_eq!(live.bytes, std::fs::metadata(&output).unwrap().len());
+            assert!(live.level > 0.1);
+            cmd_tx.send(WorkerCmd::Stop).unwrap();
+            let mut final_progress = None;
+            let final_bytes = loop {
+                match msg_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    RecorderMsg::Progress(update) => final_progress = Some(update),
+                    RecorderMsg::Finished { bytes, .. } => break bytes,
+                    _ => {}
+                }
+            };
+            worker.join().unwrap().unwrap();
+            assert_eq!(final_bytes, std::fs::metadata(&output).unwrap().len());
+            assert_eq!(final_progress.unwrap().bytes, final_bytes);
+            assert!(final_bytes >= live.bytes);
+            let mut decoder = std::process::Command::new("ffmpeg");
+            decoder.args(["-v", "error"]);
+            if format == OutputFormat::RawF32le {
+                decoder.args(["-f", "f32le", "-ar", "44100", "-ac", "2"]);
+            }
+            let decoded = decoder
+                .arg("-i")
+                .arg(&output)
+                .args(["-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            let rate = if format == OutputFormat::Opus {
+                48_000
+            } else {
+                44_100
+            };
+            assert_eq!(
+                decoded.stdout.len(),
+                rate / 2 * 2 * 4,
+                "worker timer and decoded duration must agree"
+            );
+            let energy = decoded
+                .stdout
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f64::from(f32::from_le_bytes(*bytes)).powi(2))
+                .sum::<f64>();
+            assert!(
+                energy / (decoded.stdout.len() / 4) as f64 > 0.01,
+                "worker output must decode to nonzero audio"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_mock_silence_absence_and_backend_failure_are_not_conflated() {
+        let empty = CaptureSnapshot::default();
+        assert!(capture_diagnostic(empty, empty, false).contains("Waiting"));
+        let diagnostics = CaptureDiagnostics::default();
+        diagnostics.record_samples(&[0.0; 441]);
+        assert!(capture_diagnostic(diagnostics.snapshot(), empty, false).contains("all-zero"));
+        diagnostics.record_samples(&[0.25; 441]);
+        assert!(capture_diagnostic(diagnostics.snapshot(), empty, false).contains("nonzero"));
+
+        for paused in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("partial.wav");
+            let accum = std::sync::Arc::new(parking_lot::Mutex::new(vec![0.0; 441]));
+            let diagnostics = CaptureDiagnostics::default();
+            diagnostics.record_samples(&[0.0; 441]);
+            diagnostics.report_error("mock backend disconnected".into());
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            if paused {
+                cmd_tx.send(WorkerCmd::Pause).unwrap();
+            }
+            let (msg_tx, msg_rx) = mpsc::channel();
+            let error = run_worker_with_capture(
+                CaptureFormat {
+                    sample_rate: 44_100,
+                    channels: 1,
+                },
+                accum,
+                diagnostics,
+                || {},
+                output.clone(),
+                96_000,
+                OutputFormat::WavPcm16le,
+                cmd_rx,
+                &msg_tx,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("mock backend disconnected"));
+            let bytes = std::fs::read(&output).unwrap();
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(
+                u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize,
+                bytes.len() - 44
+            );
+            let messages: Vec<_> = msg_rx.try_iter().collect();
+            assert!(!messages
+                .iter()
+                .any(|message| matches!(message, RecorderMsg::Finished { .. })));
+            assert!(messages.iter().any(|message| matches!(message, RecorderMsg::Progress(update) if update.bytes == bytes.len() as u64 && update.elapsed_ms == if paused { 0 } else { 10 })));
+        }
+        // All-zero samples remain a normal, successful recording.
+        let dir = tempfile::tempdir().unwrap();
+        let accum = std::sync::Arc::new(parking_lot::Mutex::new(vec![0.0; 441]));
+        let diagnostics = CaptureDiagnostics::default();
+        diagnostics.record_samples(&[0.0; 441]);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        cmd_tx.send(WorkerCmd::Stop).unwrap();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        run_worker_with_capture(
+            CaptureFormat {
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            accum,
+            diagnostics,
+            || {},
+            dir.path().join("silent.wav"),
+            96_000,
+            OutputFormat::WavPcm16le,
+            cmd_rx,
+            &msg_tx,
+        )
+        .unwrap();
+        assert!(msg_rx
+            .try_iter()
+            .any(|message| matches!(message, RecorderMsg::Finished { .. })));
+    }
+
+    #[test]
+    fn gui_format_selection_changes_sink_and_suffix_and_preserves_custom_extensions() {
+        let (_, rx) = mpsc::channel();
+        let mut app = headless_app(rx);
+        app.cfg.output_path = "recording.opus".into();
+        for format in [
+            OutputFormat::WavPcm16le,
+            OutputFormat::RawF32le,
+            OutputFormat::Opus,
+        ] {
+            app.cfg.select_format(format);
+            assert_eq!(app.cfg.output_format(), format);
+            assert_eq!(
+                PathBuf::from(&app.cfg.output_path).extension().unwrap(),
+                format.default_ext()
+            );
+            assert_eq!(app.cfg.effective_ext(), format.default_ext());
+        }
+        app.cfg.output_path = "take.custom".into();
+        app.cfg.extension = Some("custom".into());
+        app.cfg.select_format(OutputFormat::WavPcm16le);
+        assert_eq!(app.cfg.output_format(), OutputFormat::WavPcm16le);
+        assert_eq!(app.cfg.effective_ext(), "custom");
+        assert_eq!(app.cfg.output_path, "take.custom");
+        app.cfg.extension = Some("raw".into());
+        assert_eq!(app.cfg.output_format(), OutputFormat::RawF32le);
+        app.cfg.select_format(OutputFormat::Opus);
+        assert_eq!(app.cfg.output_format(), OutputFormat::Opus);
+    }
+
+    #[test]
+    fn gui_extension_keyboard_edit_survives_multiple_repaint_frames() {
+        let (_, rx) = mpsc::channel();
+        let mut app = headless_app(rx);
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(840.0, 860.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.output_settings(ui));
+            });
+        };
+        frame(&mut app, Vec::new());
+        let id = egui::Id::new("extension_override");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        ..Default::default()
+                    },
+                },
+                egui::Event::Text("o".into()),
+            ],
+        );
+        assert_eq!(app.cfg.extension.as_deref(), Some("o"));
+        frame(&mut app, vec![egui::Event::Text("gg".into())]);
+        assert_eq!(app.cfg.extension.as_deref(), Some("ogg"));
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+        frame(&mut app, Vec::new());
+        assert_eq!(app.cfg.extension.as_deref(), Some("ogg"));
+        assert_eq!(app.cfg.output_format(), OutputFormat::Opus);
+    }
+
+    #[test]
+    fn worker_late_backend_failure_while_paused_finalizes_only_recorded_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("partial.wav");
+        let accum = std::sync::Arc::new(parking_lot::Mutex::new(vec![0.25; 4410]));
+        let diagnostics = CaptureDiagnostics::default();
+        diagnostics.record_samples(&[0.25; 4410]);
+        let errors = diagnostics.clone();
+        let paused_input = accum.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let path = output.clone();
+        let worker = std::thread::spawn(move || {
+            run_worker_with_capture(
+                CaptureFormat {
+                    sample_rate: 44_100,
+                    channels: 1,
+                },
+                accum,
+                diagnostics,
+                || {},
+                path,
+                96_000,
+                OutputFormat::WavPcm16le,
+                cmd_rx,
+                &msg_tx,
+            )
+        });
+        let receive_progress = |paused| loop {
+            if let RecorderMsg::Progress(progress) =
+                msg_rx.recv_timeout(Duration::from_secs(10)).unwrap()
+            {
+                if progress.paused == paused {
+                    break progress;
+                }
+            }
+        };
+        assert_eq!(receive_progress(false).elapsed_ms, 100);
+        cmd_tx.send(WorkerCmd::Pause).unwrap();
+        assert_eq!(receive_progress(true).elapsed_ms, 100);
+        paused_input.lock().extend_from_slice(&[0.5; 4410]);
+        errors.report_error("device unplugged after pause".into());
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("device unplugged after pause"));
+        let messages: Vec<_> = msg_rx.try_iter().collect();
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, RecorderMsg::Finished { .. })));
+        let bytes = std::fs::read(output).unwrap();
+        assert_eq!(bytes.len(), 44 + 4410 * 2);
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            4410 * 2
+        );
+    }
+
+    #[test]
+    fn worker_without_callbacks_can_stop_cleanly_and_diagnoses_missing_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        cmd_tx.send(WorkerCmd::Stop).unwrap();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        run_worker_with_capture(
+            CaptureFormat {
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            CaptureDiagnostics::default(),
+            || {},
+            directory.path().join("empty.wav"),
+            96_000,
+            OutputFormat::WavPcm16le,
+            cmd_rx,
+            &msg_tx,
+        )
+        .unwrap();
+        let messages: Vec<_> = msg_rx.try_iter().collect();
+        assert!(messages.iter().any(
+            |message| matches!(message, RecorderMsg::Diagnostic(note) if note.contains("Waiting"))
+        ));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, RecorderMsg::Finished { bytes: 44, .. })));
+    }
+
+    #[test]
+    fn gui_committed_extension_keeps_precedence_over_a_different_path_format() {
+        let (_, rx) = mpsc::channel();
+        let mut app = headless_app(rx);
+        app.cfg.output_path = "take.wav".into();
+        assert_eq!(app.cfg.output_format(), OutputFormat::WavPcm16le);
+        app.cfg.edit_extension("opus".into(), true);
+        assert_eq!(app.cfg.output_format(), OutputFormat::Opus);
+        assert_eq!(app.cfg.effective_ext(), "opus");
+        app.cfg.edit_extension(String::new(), true);
+        assert_eq!(app.cfg.output_format(), OutputFormat::WavPcm16le);
+    }
+
+    #[test]
+    fn paused_diagnostics_still_distinguish_absent_zero_and_signal_input() {
+        let previous = CaptureSnapshot::default();
+        let zero = CaptureSnapshot {
+            callbacks: 1,
+            samples: 441,
+            nonzero_samples: 0,
+        };
+        let signal = CaptureSnapshot {
+            nonzero_samples: 1,
+            ..zero
+        };
+        for (current, expected) in [
+            (previous, "Waiting"),
+            (zero, "all-zero"),
+            (signal, "nonzero"),
+        ] {
+            let note = capture_diagnostic(current, previous, true);
+            assert!(note.contains(expected), "{note}");
+            assert!(note.contains("Paused"), "{note}");
+        }
     }
 }

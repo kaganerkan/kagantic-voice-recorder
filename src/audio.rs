@@ -1,14 +1,8 @@
 //! cpal audio capture + frame accumulator.
 //!
-//! Design choices:
-//! - The cpal callback runs on the real-time audio thread; it must never
-//!   block. We use a `parking_lot::Mutex<Vec<f32>>` (sync, non-async) so
-//!   pushes are O(1) without ever awaiting a future.
-//! - Opus always operates at 48 kHz internally. We negotiate the capture
-//!   device to 48 kHz when it supports that rate, falling back to the
-//!   device's default only as a last resort. When the rate differs, the
-//!   encoder's `sample_rate_from_u32` falls back to the closest supported
-//!   rate and we resample.
+//! Prefer a supported 48 kHz input configuration; retain the actual device
+//! rate otherwise. Conversion to Opus's 48 kHz clock happens in the sink.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -17,6 +11,62 @@ use cpal::{SampleFormat, SampleRate as CpalSampleRate, StreamConfig};
 use parking_lot::Mutex;
 
 use crate::encoder::OpusStreamEncoder;
+
+/// Cumulative interleaved callback counters, independent of the worker draining.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureSnapshot {
+    pub callbacks: u64,
+    pub samples: u64,
+    pub nonzero_samples: u64,
+}
+
+/// Shared callback diagnostics; no logging subscriber is needed to retain errors.
+#[derive(Clone, Default)]
+pub struct CaptureDiagnostics {
+    inner: Arc<CaptureDiagnosticsInner>,
+}
+
+#[derive(Default)]
+struct CaptureDiagnosticsInner {
+    callbacks: AtomicU64,
+    samples: AtomicU64,
+    nonzero_samples: AtomicU64,
+    error: Mutex<Option<String>>,
+}
+
+impl CaptureDiagnostics {
+    pub fn record_samples(&self, samples: &[f32]) {
+        self.record_counts(samples.len(), samples.iter().filter(|&&s| s != 0.0).count());
+    }
+
+    fn record_counts(&self, samples: usize, nonzero: usize) {
+        self.inner
+            .samples
+            .fetch_add(samples as u64, Ordering::Relaxed);
+        self.inner
+            .nonzero_samples
+            .fetch_add(nonzero as u64, Ordering::Relaxed);
+        self.inner.callbacks.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn report_error(&self, error: String) {
+        tracing::error!("capture backend: {error}");
+        // Preserve the first failure rather than replacing it with cascading errors.
+        self.inner.error.lock().get_or_insert(error);
+    }
+
+    pub fn snapshot(&self) -> CaptureSnapshot {
+        CaptureSnapshot {
+            callbacks: self.inner.callbacks.load(Ordering::Acquire),
+            samples: self.inner.samples.load(Ordering::Relaxed),
+            nonzero_samples: self.inner.nonzero_samples.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.inner.error.lock().take()
+    }
+}
 
 /// Negotiated capture format we expose to the rest of the app.
 #[derive(Debug, Clone)]
@@ -29,6 +79,7 @@ pub struct CaptureFormat {
 pub struct Capture {
     pub stream: cpal::Stream,
     pub format: CaptureFormat,
+    pub diagnostics: CaptureDiagnostics,
 }
 
 /// The accumulator shared between the cpal real-time thread (lock + extend) and
@@ -68,32 +119,31 @@ pub fn start_capture_named(
 }
 
 fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<(Capture, Accum)> {
-    // Negotiate: prefer 48 kHz (matches libopus internal rate), fall back to
-    // the device default if 48 kHz isn't in the supported config list.
-    let (cfg, channels, sample_rate) = negotiate_config(&device, channels_hint)?;
+    let cfg = negotiate_config(&device, channels_hint)?;
     let sample_format = cfg.sample_format();
-
-    let stream_config = StreamConfig {
-        channels,
-        sample_rate: CpalSampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
+    let channels = cfg.channels();
+    let sample_rate = cfg.sample_rate().0;
+    let stream_config: StreamConfig = cfg.into();
 
     let accum: Accum = Arc::new(Mutex::new(Vec::with_capacity(
         sample_rate as usize * channels as usize / 50, // ~20ms of audio
     )));
 
-    let err_fn = |e| tracing::error!("cpal stream error: {e}");
+    let diagnostics = CaptureDiagnostics::default();
+    let errors = diagnostics.clone();
+    let err_fn = move |e: cpal::StreamError| errors.report_error(e.to_string());
 
     let stream = match sample_format {
         SampleFormat::F32 => {
             let accum_cb = accum.clone();
+            let diagnostics = diagnostics.clone();
             device
                 .build_input_stream(
                     &stream_config,
                     move |data: &[f32], _| {
                         let mut buf = accum_cb.lock();
                         buf.extend_from_slice(data);
+                        diagnostics.record_samples(data);
                     },
                     err_fn,
                     None,
@@ -102,6 +152,7 @@ fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<
         }
         SampleFormat::I16 => {
             let accum_cb = accum.clone();
+            let diagnostics = diagnostics.clone();
             device
                 .build_input_stream(
                     &stream_config,
@@ -110,6 +161,8 @@ fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<
                         for &s in data {
                             buf.push(s as f32 / 32768.0);
                         }
+                        diagnostics
+                            .record_counts(data.len(), data.iter().filter(|&&s| s != 0).count());
                     },
                     err_fn,
                     None,
@@ -118,6 +171,7 @@ fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<
         }
         SampleFormat::U16 => {
             let accum_cb = accum.clone();
+            let diagnostics = diagnostics.clone();
             device
                 .build_input_stream(
                     &stream_config,
@@ -126,6 +180,10 @@ fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<
                         for &s in data {
                             buf.push((s as f32 - 32768.0) / 32768.0);
                         }
+                        diagnostics.record_counts(
+                            data.len(),
+                            data.iter().filter(|&&s| s != 32768).count(),
+                        );
                     },
                     err_fn,
                     None,
@@ -148,71 +206,59 @@ fn start_capture_with_device(device: cpal::Device, channels_hint: u8) -> Result<
             stream,
             format: CaptureFormat {
                 sample_rate,
-                channels: channels.try_into().expect("device channels fit in u8"),
+                channels: channels as u8,
             },
+            diagnostics,
         },
         accum,
     ))
 }
 
-/// Negotiate a stream config: prefer 48 kHz, mono (unless the user pinned a
-/// channel count), 16-bit or f32. Returns (supported_config, channels, rate).
+/// Select an actual rate/channel/format tuple, not a fabricated StreamConfig.
 fn negotiate_config(
     device: &cpal::Device,
     channels_hint: u8,
-) -> Result<(cpal::SupportedStreamConfig, u16, u32)> {
-    // First, walk the supported config range list and prefer 48 kHz.
-    let supported = device
-        .supported_input_configs()
-        .context("query supported input configs")?;
+) -> Result<cpal::SupportedStreamConfig> {
+    select_config(
+        device
+            .supported_input_configs()
+            .context("query supported input configs")?,
+        channels_hint,
+    )
+}
 
-    // Filter to configs whose max sample rate ≥ 48000 and min ≤ 48000, with
-    // at least 1 channel. Also require f32 or i16 (drop u16 because it's
-    // not commonly supported and we already had bugs in that path).
-    let mut candidates: Vec<cpal::SupportedStreamConfigRange> = supported.collect();
-    // Prefer matching sample format first (f32 > i16 > u16), then 48 kHz.
-    candidates.sort_by_key(|r| {
-        let rate_score =
-            if r.min_sample_rate().0 <= PREFERRED_RATE && r.max_sample_rate().0 >= PREFERRED_RATE {
-                0
-            } else if r.max_sample_rate().0 >= PREFERRED_RATE {
-                1
-            } else {
-                2
-            };
-        let fmt_score = match r.sample_format() {
-            SampleFormat::F32 => 0,
-            SampleFormat::I16 => 1,
-            _ => 2,
-        };
-        let chan_score = if channels_hint == 0 {
-            if r.channels() == 1 {
-                0
-            } else {
-                1
-            }
-        } else if r.channels() == u16::from(channels_hint) {
-            0
-        } else {
-            1
-        };
-        (rate_score, fmt_score, chan_score)
-    });
-
-    let range = candidates
+fn select_config(
+    supported: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+    channels_hint: u8,
+) -> Result<cpal::SupportedStreamConfig> {
+    let selected = supported
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no supported input configs"))?;
-
-    let channels = if channels_hint == 0 {
-        range.channels()
-    } else {
-        // Use the user's hint if it's within what the range supports.
-        range.channels().min(channels_hint.into())
-    };
-
-    let cfg = range.with_sample_rate(CpalSampleRate(PREFERRED_RATE));
-    Ok((cfg, channels, PREFERRED_RATE))
+        .filter_map(|range| {
+            let channels = range.channels();
+            if !(1..=2).contains(&channels)
+                || (channels_hint != 0 && channels != u16::from(channels_hint))
+                || range.min_sample_rate().0 == 0
+                || range.min_sample_rate() > range.max_sample_rate()
+            {
+                return None;
+            }
+            let format_score = match range.sample_format() {
+                SampleFormat::F32 => 0,
+                SampleFormat::I16 => 1,
+                SampleFormat::U16 => 2,
+                _ => return None,
+            };
+            let rate = PREFERRED_RATE.clamp(range.min_sample_rate().0, range.max_sample_rate().0);
+            let score = (rate.abs_diff(PREFERRED_RATE), channels, format_score);
+            Some((score, range, rate))
+        })
+        .min_by_key(|(score, _, _)| *score);
+    let (_, range, rate) = selected.ok_or_else(|| anyhow!(
+        "no supported mono/stereo F32, I16 or U16 input configuration matching requested channels ({channels_hint}; 0 = automatic)"
+    ))?;
+    range
+        .try_with_sample_rate(CpalSampleRate(rate))
+        .ok_or_else(|| anyhow!("input sample rate {rate} is outside the advertised range"))
 }
 
 /// Drain exactly one Opus frame from the accumulator. Sync; never blocks.
@@ -256,4 +302,72 @@ pub async fn try_take_frame(accum: &Accum, enc: &OpusStreamEncoder) -> Option<Ve
 /// Async wrapper around `discard_partial_blocking`.
 pub async fn discard_partial(accum: &Accum) {
     discard_partial_blocking(accum);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(
+        channels: u16,
+        min: u32,
+        max: u32,
+        format: SampleFormat,
+    ) -> cpal::SupportedStreamConfigRange {
+        cpal::SupportedStreamConfigRange::new(
+            channels,
+            CpalSampleRate(min),
+            CpalSampleRate(max),
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn only_44100_stereo_is_selected_without_fabricating_mono_or_48000() {
+        let config = select_config([range(2, 44_100, 44_100, SampleFormat::I16)], 0).unwrap();
+        assert_eq!(config.channels(), 2);
+        assert_eq!(config.sample_rate().0, 44_100);
+        assert_eq!(config.sample_format(), SampleFormat::I16);
+        assert!(select_config([range(2, 44_100, 44_100, SampleFormat::I16)], 1).is_err());
+    }
+
+    #[test]
+    fn prefers_supported_48000_and_filters_unsupported_formats_and_channels() {
+        let config = select_config(
+            [
+                range(1, 44_100, 44_100, SampleFormat::F32),
+                range(2, 44_100, 96_000, SampleFormat::U16),
+                range(1, 48_000, 48_000, SampleFormat::I32),
+                range(256, 48_000, 48_000, SampleFormat::F32),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(config.sample_rate().0, 48_000);
+        assert_eq!(config.channels(), 2);
+        assert_eq!(config.sample_format(), SampleFormat::U16);
+        assert!(select_config([], 0).is_err());
+        assert!(select_config([range(1, 0, 0, SampleFormat::F32)], 0).is_err());
+        assert!(select_config([range(1, 48_000, 48_000, SampleFormat::I32)], 0).is_err());
+    }
+
+    #[test]
+    fn capture_diagnostics_distinguish_absent_zero_signal_and_retained_failure() {
+        let diagnostics = CaptureDiagnostics::default();
+        assert_eq!(diagnostics.snapshot().callbacks, 0);
+        diagnostics.record_samples(&[0.0, 0.0]);
+        assert_eq!(diagnostics.snapshot().callbacks, 1);
+        assert_eq!(diagnostics.snapshot().samples, 2);
+        assert_eq!(diagnostics.snapshot().nonzero_samples, 0);
+        diagnostics.record_samples(&[0.25, -0.25, 0.0]);
+        assert_eq!(diagnostics.snapshot().nonzero_samples, 2);
+        diagnostics.report_error("device disconnected".into());
+        diagnostics.report_error("secondary error".into());
+        assert_eq!(
+            diagnostics.take_error().as_deref(),
+            Some("device disconnected")
+        );
+        assert_eq!(diagnostics.take_error(), None);
+    }
 }
