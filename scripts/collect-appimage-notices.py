@@ -19,11 +19,12 @@ def digest(path):
 
 
 def build_id(path):
+    with path.open('rb') as stream:
+        if stream.read(4) != b'\x7fELF':
+            return None
     notes = subprocess.check_output(['readelf', '-n', str(path)], text=True)
     match = re.search(r'Build ID:\s*([0-9a-f]+)', notes)
-    if not match:
-        raise RuntimeError(f'Library has no distribution build ID: {path}')
-    return match[1]
+    return match[1] if match else None
 
 
 def collect(appdir):
@@ -48,7 +49,7 @@ def collect(appdir):
         provenance['distribution'] = 'Freedesktop SDK'
         provenance['sources'] = 'freedesktop-sdk-manifest.json contains original source URLs and revisions'
     elif shutil.which('dpkg-query'):
-        distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+        distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text(encoding='utf-8').splitlines()
                       if '=' in line).get('ID', '').strip('"')
         if distro not in ('ubuntu', 'debian'):
             raise RuntimeError(f'Unsupported distribution source archive: {distro}')
@@ -58,6 +59,8 @@ def collect(appdir):
         for library in libraries:
             # linuxdeploy changes RPATH/strips ELF files; GNU build IDs remain stable.
             identity = build_id(library)
+            if not identity:
+                raise RuntimeError(f'Deployed library has no distribution build ID: {library}')
             query = subprocess.run(['dpkg-query', '-S', '*/' + library.name],
                                    check=True, capture_output=True, text=True)
             matches = set()
@@ -90,6 +93,8 @@ def collect(appdir):
         provenance['sources'] = 'Distribution sources linked by exact version; packaging changes ELF RPATH/stripping only'
     else:
         raise RuntimeError('AppImage notices require Debian/Ubuntu package metadata or Freedesktop SDK licenses and manifest')
+    provenance['notices'] = [{'path': str(path.relative_to(destination)), 'sha256': digest(path)}
+                             for path in sorted(destination.rglob('*')) if path.is_file()]
     (destination / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
     print(f'Deployed library notices and source provenance collected for {len(libraries)} ELF files')
 

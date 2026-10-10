@@ -142,6 +142,8 @@ for notice in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'assets/fonts/Silkscreen-OFL
     assert (root / notice).is_file(), notice
 notices = root / 'usr/share/doc/kagantic-voice-recorder/libraries'
 provenance = json.loads((notices / 'provenance.json').read_text())
+for notice in provenance['notices']:
+    assert hashlib.sha256((notices / notice['path']).read_bytes()).hexdigest() == notice['sha256']
 for library in provenance['libraries']:
     assert hashlib.sha256((root / library['path']).read_bytes()).hexdigest() == library['sha256']
 if provenance['distribution'] == 'Freedesktop SDK':
