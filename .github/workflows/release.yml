@@ -430,8 +430,25 @@ jobs:
             "release/files/kvr-gui-v${VERSION}-windows-x86_64.exe.sha256"
             "release/files/SHA256SUMS"
           )
+          notes="$RUNNER_TEMP/kvr-release-notes.md"
+          cat > "$notes" <<EOF
+          ## Direct downloads
+
+          | Application | Download |
+          | --- | --- |
+          | Windows GUI | [Standalone EXE](https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/kvr-gui-v${VERSION}-windows-x86_64.exe) |
+          | Linux GUI | [AppImage](https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/kvr-gui-v${VERSION}-linux-x86_64.AppImage) |
+          | Windows CLI | [Standalone EXE](https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/kvr-v${VERSION}-windows-x86_64.exe) |
+
+          The GUI uses the original Kagan Erkan pixel logo for its native window and packaged application icons.
+          ZIP and tar.gz bundles remain available. Each binary download has a SHA256 sidecar; SHA256SUMS covers all five downloads.
+          Linux: make the AppImage executable before launching. File managers without AppImage integration may still show a generic file-type icon.
+
+          [Licenses and third-party notices](https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/THIRD_PARTY_NOTICES.md)
+          EOF
           gh release create "${tag}" \
             --title "${tag}" \
             --verify-tag \
             --generate-notes \
+            --notes-file "$notes" \
             "${files[@]}"

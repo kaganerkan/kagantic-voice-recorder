@@ -84,6 +84,9 @@ Practical notes:
   `/tmp` or `C:\tmp` setup is required.
 - Device-picker unit tests run without opening any capture device; use them
   when touching `devices.rs` — no hardware is required.
+- The packaged Linux GUI smoke checks the live X11 icon and desktop identity.
+  On GitHub Actions, failures also emit escaped error annotations with startup
+  diagnostics; an AppImage build alone is not a successful GUI smoke run.
 
 ## Verifying a real recording
 

@@ -35,6 +35,15 @@ def run(command, env):
     return subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT)
 
 
+def github_error(message):
+    """Print GitHub Actions error annotation if running in CI."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        # Escape special characters for GitHub Actions workflow commands
+        # % -> %25, CR -> %0D, LF -> %0A
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error::{escaped}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("appimage", type=Path)
@@ -42,6 +51,7 @@ def main():
     parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
     appimage = args.appimage.resolve(strict=True)
+
     logo = Image.open(Path(__file__).resolve().parents[1] / "assets/pixel-art-logo.png").convert("RGBA")
     expected = [((a << 24) | (r << 16) | (g << 8) | b)
                 for r, g, b, a in struct.iter_unpack("4B", logo.tobytes())]
@@ -59,17 +69,18 @@ def main():
             else:
                 read_fd, write_fd = os.pipe()
                 try:
-                    server = subprocess.Popen(
-                        ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1024x960x24", "-nolisten", "tcp"],
-                        pass_fds=(write_fd,), stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE, start_new_session=True)
+                    with (root / "xvfb.log").open("wb") as xvfb_stderr:
+                        server = subprocess.Popen(
+                            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1024x960x24", "-nolisten", "tcp"],
+                            pass_fds=(write_fd,), stdout=subprocess.DEVNULL,
+                            stderr=xvfb_stderr, start_new_session=True)
                     os.close(write_fd)
                     write_fd = None
                     if not select.select([read_fd], [], [], 20)[0]:
-                        raise RuntimeError("Xvfb did not become ready")
+                        raise RuntimeError("Xvfb did not become ready: " + (root / "xvfb.log").read_text(errors="replace"))
                     display = os.read(read_fd, 64).decode().strip()
                     if not display.isdigit():
-                        raise RuntimeError("Xvfb failed to allocate an X11 display")
+                        raise RuntimeError("Xvfb failed to allocate an X11 display: " + (root / "xvfb.log").read_text(errors="replace"))
                     env["DISPLAY"] = ":" + display
                 finally:
                     os.close(read_fd)
@@ -82,7 +93,9 @@ def main():
                 window = None
                 while time.monotonic() < deadline:
                     if app.poll() is not None:
-                        raise RuntimeError("GUI exited before rendering: " + (root / "gui.log").read_text(errors="replace"))
+                        gui_log = (root / "gui.log").read_text(errors="replace")
+                        msg = "GUI exited before rendering: " + gui_log
+                        raise RuntimeError(msg)
                     if args.display:
                         clients = run(["xprop", "-root", "_NET_CLIENT_LIST"], env)
                         for candidate in re.findall(r'0x[0-9a-fA-F]+', clients):
@@ -101,7 +114,9 @@ def main():
                         break
                     time.sleep(0.2)
                 if window is None:
-                    raise RuntimeError("GUI window did not appear: " + (root / "gui.log").read_text(errors="replace"))
+                    gui_log = (root / "gui.log").read_text(errors="replace")
+                    msg = "GUI window did not appear: " + gui_log
+                    raise RuntimeError(msg)
                 identity = run(["xprop", "-id", window, "WM_CLASS"], env)
                 if APP_ID not in identity:
                     raise RuntimeError("Unexpected GUI desktop identity: " + identity)
@@ -141,4 +156,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        message = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            message += "\n" + (error.output or "")
+        github_error(message)
+        raise
