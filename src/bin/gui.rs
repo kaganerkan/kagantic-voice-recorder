@@ -1567,10 +1567,14 @@ fn main() -> eframe::Result<()> {
         Ok(path) => format!("Local diagnostics: {}", path.display()),
         Err(error) => format!("Local diagnostics unavailable: {error:#}"),
     };
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/pixel-art-logo.png"))
+        .expect("bundled application icon must be a valid PNG");
     let result = eframe::run_native(
         "Kagantic Voice Recorder",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
+                .with_icon(icon)
+                .with_app_id("com.github.kaganerkan.KaganticVoiceRecorder")
                 .with_inner_size([840.0, 860.0])
                 .with_min_inner_size([340.0, 540.0])
                 .with_resizable(true),

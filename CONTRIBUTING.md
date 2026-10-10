@@ -72,7 +72,7 @@ deterministic, and needs no microphone, audio server, or window display:
 | `tests/recording_pipeline.rs` | production drain/sinks at 44.1 kHz stereo with irregular callbacks and partial tail; live/final byte counts equal file length; ffmpeg verifies decoded frame count, nonzero channel-specific tones, bit-exact raw; ffprobe validates rate/channels/duration; Ogg framing, CRC, EOS and granule checked; existing output never truncated |
 | unit tests in `src/audio.rs` / `src/output.rs` | supported 44.1 kHz configurations, unsupported/hinted channel errors, callback/error diagnostics, continuous-phase channel-safe resampling |
 | unit tests in `src/lib.rs` / `src/writers.rs` | CLI destination resolution/collisions preserve existing takes, native directory respected, headerless empty WAV and classic RIFF limit boundary without allocating a 4 GiB file |
-| `scripts/check-windows-pe.py --self-test` | header-only fixtures accept GUI Subsystem 2 / CLI Subsystem 3 and reject swapped subsystems, wrong architecture, malformed/truncated PE headers; fixtures are not runtime artifacts |
+| `scripts/check-windows-pe.py --self-test` | non-executable header/resource fixtures accept GUI Subsystem 2 / CLI Subsystem 3 and reject swapped subsystems, wrong architecture, malformed headers, missing/wrong icon groups or pixels and out-of-bounds resource directories |
 | unit tests in `src/bin/gui.rs` | mocked production workers verify live/final size and ffmpeg decoded nonzero samples/duration; absent callbacks/valid silence, late backend failure while paused and valid partial WAV; writable output fallback and GUI saved/error states; format/extension precedence; multi-frame egui keyboard editing and paused level history |
 | unit tests in `src/session.rs` (Windows) | real-process liveness: own PID, running child, and completed child; the helper child is always killed and reaped |
 
@@ -127,8 +127,9 @@ ffmpeg -i recording.opus -f wav out.wav
 - Packaging scripts have a fixed interface:
 
   ```bash
-  bash scripts/package-release.sh v0.1.2 --bin-dir target/release --output-dir dist
-  pwsh scripts/package-release.ps1 v0.1.2 -BinDir target/release -OutputDir dist
+  bash scripts/package-release.sh v0.1.3 --bin-dir target/release --output-dir dist
+  bash scripts/package-appimage.sh v0.1.3 --bin-dir target/release --output-dir dist
+  pwsh scripts/package-release.ps1 v0.1.3 -BinDir target/release -OutputDir dist
   ```
 
   They enforce the version match, the single-root archive layout, the
@@ -141,6 +142,14 @@ ffmpeg -i recording.opus -f wav out.wav
   ZIP entries are written explicitly with forward-slash paths, including on
   Windows PowerShell 5.1; `Compress-Archive` can otherwise emit backslash names
   that violate the canonical archive-layout check.
+  Windows packaging also emits direct version-named CLI/GUI EXEs with sidecars.
+  The PE checker validates ICON/GROUP_ICON frames against the original-logo ICO;
+  native Windows additionally compares shell-extracted icon pixels to the PNG.
+  AppImage packaging uses pinned linuxdeploy/GTK tooling, bundles native dialog
+  dependencies, schemas, icons and notices, and validates the extracted image.
+  It requires Pillow (`python3-pil` on Ubuntu). `scripts/check-linux-gui.py`
+  runs the actual AppImage under Xvfb/Mesa and checks `WM_CLASS` and `_NET_WM_ICON`
+  pixels; CI needs `xvfb`, `x11-utils`, `imagemagick` and `libgl1-mesa-dri`.
   Keep `.cargo/config.toml` and `.cargo/msvc-runtime.cmake` enabled: Rust and
   bundled libopus must both use the static MSVC runtime. Runner smoke tests alone
   cannot detect dynamic-runtime regressions because the runner has the redistributable.

@@ -25,9 +25,9 @@
 # Usage (relative paths are resolved against the repository root):
 #
 #   Windows host:
-#     pwsh scripts/package-release.ps1 v0.1.2 -BinDir target\release -OutputDir dist
+#     pwsh scripts/package-release.ps1 v0.1.3 -BinDir target\release -OutputDir dist
 #   Linux host (real cross-built PE binaries):
-#     pwsh scripts/package-release.ps1 v0.1.2 -Platform windows -BinDir target/x86_64-pc-windows-msvc/release -OutputDir dist
+#     pwsh scripts/package-release.ps1 v0.1.3 -Platform windows -BinDir target/x86_64-pc-windows-msvc/release -OutputDir dist
 #
 # The version (with or without a leading "v") must equal the Cargo package
 # version. Python 3 inspects x86-64 PE32+ headers: GUI Subsystem 2, CLI
@@ -39,7 +39,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true,
-               HelpMessage = 'Release version with an optional "v" prefix (e.g. v0.1.2). Must equal the Cargo package version.')]
+               HelpMessage = 'Release version with an optional "v" prefix (e.g. v0.1.3). Must equal the Cargo package version.')]
     [string]$TagOrVersion,
 
     [Parameter(HelpMessage = 'Directory containing the release binaries (default: target/release).')]
@@ -167,9 +167,21 @@ else {
 }
 
 function Assert-WindowsBinaries {
-    param([string]$Directory)
-    & $python.Source $peChecker --cli (Join-Path $Directory 'kvr.exe') --gui (Join-Path $Directory 'kvr-gui.exe')
+    param(
+        [string]$Directory,
+        [string]$CanonicalIcon = ''
+    )
+    $cliPath = Join-Path $Directory 'kvr.exe'
+    $guiPath = Join-Path $Directory 'kvr-gui.exe'
+    
+    if ($CanonicalIcon) {
+        & $python.Source $peChecker --cli $cliPath --gui $guiPath --icon $CanonicalIcon
+    }
+    else {
+        & $python.Source $peChecker --cli $cliPath --gui $guiPath
+    }
     if ($LASTEXITCODE -ne 0) { throw "PE subsystem/architecture check failed in $Directory" }
+
 foreach ($bin in @('kvr', 'kvr-gui')) {
     $src = Join-Path $Directory ($bin + $exe)
     if ($hostWindows) {
@@ -189,6 +201,7 @@ foreach ($bin in @('kvr', 'kvr-gui')) {
 # succeed, and --version must report exactly `kvr <VERSION>`.
 if ($hostWindows) {
     $cli = Join-Path $Directory ('kvr' + $exe)
+    & (Join-Path $PSScriptRoot 'check-windows-icons.ps1') -Cli $cliPath -Gui $guiPath
     $help = & $cli --help 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kvr --help failed: $($help -join ' ')" }
     $versionOut = & $cli --version 2>&1
@@ -204,8 +217,20 @@ else {
 
 }
 
-Assert-WindowsBinaries $BinDirAbs
+$canonicalIcon = Join-Path $RootDir 'assets/pixel-art-logo.ico'
+Assert-WindowsBinaries $BinDirAbs $canonicalIcon
 $rootName = "kvr-v$V-windows-x86_64"
+$cliVersioned = "kvr-v$V-windows-x86_64.exe"
+$guiVersioned = "kvr-gui-v$V-windows-x86_64.exe"
+$cliDest = Join-Path $OutputDirAbs $cliVersioned
+$guiDest = Join-Path $OutputDirAbs $guiVersioned
+foreach ($path in @(
+    (Join-Path $OutputDirAbs "$rootName.zip"),
+    (Join-Path $OutputDirAbs "$rootName.zip.sha256"),
+    $cliDest, "$cliDest.sha256", $guiDest, "$guiDest.sha256"
+)) {
+    if (Test-Path -LiteralPath $path) { throw "output already exists (not overwriting): $path" }
+}
 $staging = Join-Path ([System.IO.Path]::GetTempPath()) ('kvr-pack-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null
 $destRoot = Join-Path $staging $rootName
@@ -270,7 +295,7 @@ try {
     finally { $zip.Dispose() }
     $extracted = Join-Path $staging 'extracted'
     Expand-Archive -LiteralPath $archivePath -DestinationPath $extracted
-    Assert-WindowsBinaries (Join-Path $extracted $rootName)
+    Assert-WindowsBinaries (Join-Path $extracted $rootName) $canonicalIcon
 
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
     if ($hash -notmatch '^[0-9a-f]{64}$') { throw "unexpected SHA-256 output: $hash" }
@@ -290,6 +315,51 @@ try {
 
     Write-Host "wrote $archivePath"
     Write-Host "wrote $sidecarPath"
+
+    # Direct downloads are byte-identical to the already validated binaries.
+    $cliSrc = Join-Path $BinDirAbs 'kvr.exe'
+    $guiSrc = Join-Path $BinDirAbs 'kvr-gui.exe'
+    # Copy CLI EXE using System.IO.File.Copy (no overwrite)
+    [System.IO.File]::Copy($cliSrc, $cliDest, $false)
+    Write-Host "wrote $cliDest"
+
+    # Create CLI SHA256 sidecar
+    $cliHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cliDest).Hash.ToLowerInvariant()
+    $cliSidecar = "$cliDest.sha256"
+    $cliStream = [System.IO.File]::Open($cliSidecar, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("$cliHash  $cliVersioned`n")
+        $cliStream.Write($bytes, 0, $bytes.Length)
+    }
+    finally { $cliStream.Dispose() }
+    Write-Host "wrote $cliSidecar"
+
+    # Copy GUI EXE using System.IO.File.Copy (no overwrite)
+    [System.IO.File]::Copy($guiSrc, $guiDest, $false)
+    Write-Host "wrote $guiDest"
+
+    # Create GUI SHA256 sidecar
+    $guiHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $guiDest).Hash.ToLowerInvariant()
+    $guiSidecar = "$guiDest.sha256"
+    $guiStream = [System.IO.File]::Open($guiSidecar, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("$guiHash  $guiVersioned`n")
+        $guiStream.Write($bytes, 0, $bytes.Length)
+    }
+    finally { $guiStream.Dispose() }
+    Write-Host "wrote $guiSidecar"
+
+    # Verify copied binaries match source hashes
+    $cliSrcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cliSrc).Hash.ToLowerInvariant()
+    $guiSrcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $guiSrc).Hash.ToLowerInvariant()
+    if ($cliHash -ne $cliSrcHash) { throw "CLI hash mismatch after copy" }
+    if ($guiHash -ne $guiSrcHash) { throw "GUI hash mismatch after copy" }
+
+    & $python.Source $peChecker --cli $cliDest --gui $guiDest --icon $canonicalIcon
+    if ($LASTEXITCODE -ne 0) { throw "copied binary validation failed" }
+    if ($hostWindows) {
+        & (Join-Path $PSScriptRoot 'check-windows-icons.ps1') -Cli $cliDest -Gui $guiDest
+    }
 }
 finally {
     Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue

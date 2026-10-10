@@ -177,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg libasound2-dev libgtk-3-dev pkg-config cmake
+          sudo apt-get install -y ffmpeg libasound2-dev libgtk-3-dev pkg-config cmake python3-pil xvfb x11-utils imagemagick libgl1-mesa-dri
           ffmpeg -version
           ffprobe -version
 
@@ -253,6 +253,18 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/package-release.sh "$RELEASE_VERSION" --bin-dir target/release --output-dir dist
+
+      - name: Package branded AppImage (linux)
+        if: matrix.platform == 'linux'
+        env:
+          RELEASE_VERSION: "v${{ needs.preflight.outputs.version }}"
+        run: bash scripts/package-appimage.sh "$RELEASE_VERSION" --bin-dir target/release --output-dir dist
+
+      - name: Smoke packaged GUI and native icon (linux)
+        if: matrix.platform == 'linux'
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: python3 scripts/check-linux-gui.py "dist/kvr-gui-v${VERSION}-linux-x86_64.AppImage" --screenshot "$RUNNER_TEMP/kvr-appimage-gui.png"
 
       - name: Package release archive (windows)
         if: matrix.platform == 'windows'
@@ -333,15 +345,17 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          linux_archive="release/linux/kvr-v${VERSION}-linux-x86_64.tar.gz"
-          linux_sidecar="${linux_archive}.sha256"
-          windows_archive="release/windows/kvr-v${VERSION}-windows-x86_64.zip"
-          windows_sidecar="${windows_archive}.sha256"
-          for f in "$linux_archive" "$linux_sidecar" "$windows_archive" "$windows_sidecar"; do
-            [ -f "$f" ] || { echo "missing expected artifact file: $f"; exit 1; }
+          files=(
+            "release/linux/kvr-v${VERSION}-linux-x86_64.tar.gz"
+            "release/linux/kvr-gui-v${VERSION}-linux-x86_64.AppImage"
+            "release/windows/kvr-v${VERSION}-windows-x86_64.zip"
+            "release/windows/kvr-v${VERSION}-windows-x86_64.exe"
+            "release/windows/kvr-gui-v${VERSION}-windows-x86_64.exe"
+          )
+          for file in "${files[@]}"; do
+            [ -f "$file" ] && [ -f "$file.sha256" ] || { echo "missing asset or checksum: $file"; exit 1; }
+            (cd "$(dirname "$file")" && sha256sum -c --quiet "$(basename "$file").sha256")
           done
-          (cd release/linux && sha256sum -c --quiet "kvr-v${VERSION}-linux-x86_64.tar.gz.sha256")
-          (cd release/windows && sha256sum -c --quiet "kvr-v${VERSION}-windows-x86_64.zip.sha256")
 
       - name: Aggregate SHA256SUMS
         env:
@@ -349,14 +363,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release/files
-          cp "release/linux/kvr-v${VERSION}-linux-x86_64.tar.gz" release/files/
-          cp "release/linux/kvr-v${VERSION}-linux-x86_64.tar.gz.sha256" release/files/
-          cp "release/windows/kvr-v${VERSION}-windows-x86_64.zip" release/files/
-          cp "release/windows/kvr-v${VERSION}-windows-x86_64.zip.sha256" release/files/
-          {
-            cat "release/files/kvr-v${VERSION}-linux-x86_64.tar.gz.sha256"
-            cat "release/files/kvr-v${VERSION}-windows-x86_64.zip.sha256"
-          } > "release/files/SHA256SUMS"
+          for file in \
+            "release/linux/kvr-v${VERSION}-linux-x86_64.tar.gz" \
+            "release/linux/kvr-gui-v${VERSION}-linux-x86_64.AppImage" \
+            "release/windows/kvr-v${VERSION}-windows-x86_64.zip" \
+            "release/windows/kvr-v${VERSION}-windows-x86_64.exe" \
+            "release/windows/kvr-gui-v${VERSION}-windows-x86_64.exe"; do
+            cp "$file" "$file.sha256" release/files/
+          done
+          cat release/files/*.sha256 > release/files/SHA256SUMS
           (cd release/files && sha256sum -c --quiet SHA256SUMS)
 
       - name: Smoke the release CLI
@@ -407,6 +422,12 @@ jobs:
             "release/files/kvr-v${VERSION}-linux-x86_64.tar.gz.sha256"
             "release/files/kvr-v${VERSION}-windows-x86_64.zip"
             "release/files/kvr-v${VERSION}-windows-x86_64.zip.sha256"
+            "release/files/kvr-gui-v${VERSION}-linux-x86_64.AppImage"
+            "release/files/kvr-gui-v${VERSION}-linux-x86_64.AppImage.sha256"
+            "release/files/kvr-v${VERSION}-windows-x86_64.exe"
+            "release/files/kvr-v${VERSION}-windows-x86_64.exe.sha256"
+            "release/files/kvr-gui-v${VERSION}-windows-x86_64.exe"
+            "release/files/kvr-gui-v${VERSION}-windows-x86_64.exe.sha256"
             "release/files/SHA256SUMS"
           )
           gh release create "${tag}" \

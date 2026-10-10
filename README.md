@@ -29,11 +29,28 @@
 
 ## Platforms
 
-| Platform | Release archive | Runtime notes |
+| Platform | Downloads | Runtime notes |
 |---|---|---|
-| **Linux x86_64** (glibc 2.35+, e.g. Ubuntu 22.04+) | `kvr-v0.1.2-linux-x86_64.tar.gz` (`kvr`, `kvr-gui`) | ALSA capture; GTK 3 (native save dialog); OpenGL for the GUI renderer |
-| **Windows x86_64** (MSVC) | `kvr-v0.1.2-windows-x86_64.zip` (`kvr.exe`, `kvr-gui.exe`) | WASAPI capture; MSVC runtime statically linked, no separate Visual C++ Redistributable required |
+| **Linux x86_64** (glibc 2.35+, e.g. Ubuntu 22.04+) | `kvr-gui-v0.1.3-linux-x86_64.AppImage` (GUI); `kvr-v0.1.3-linux-x86_64.tar.gz` (CLI + GUI) | AppImage bundles GTK 3 and its native save-dialog dependencies; ALSA and working OpenGL 2.0+ graphics remain required |
+| **Windows x86_64** (MSVC) | `kvr-gui-v0.1.3-windows-x86_64.exe` (GUI); `kvr-v0.1.3-windows-x86_64.exe` (CLI); `kvr-v0.1.3-windows-x86_64.zip` (both + notices) | Standalone EXEs need no extraction or separate Visual C++ Redistributable; MSVC runtime remains statically linked |
 | **macOS** | not a release target | CoreAudio support exists in `cpal`; macOS builds are not verified by this project's CI |
+
+**Direct GUI downloads:** on Windows, open the file whose name starts with
+`kvr-gui-` (the CLI intentionally opens a console). On Linux:
+
+```bash
+chmod +x kvr-gui-v0.1.3-linux-x86_64.AppImage
+./kvr-gui-v0.1.3-linux-x86_64.AppImage
+# If FUSE is unavailable:
+./kvr-gui-v0.1.3-linux-x86_64.AppImage --appimage-extract-and-run
+```
+
+Both the native window and packaged application metadata use the original
+pixel logo. Windows EXEs embed multi-size ICO resources. The AppImage contains
+the matching desktop entry, hicolor PNGs and `.DirIcon`. A file manager without
+AppImage integration may still display its generic file-type icon; desktop
+integration installs the embedded launcher/icon for the application menu and
+Wayland dock. No system icon theme or graphics driver is replaced.
 
 ## Quick start
 
@@ -107,7 +124,8 @@ ffmpeg -i recording.opus -f wav out.wav
 
 On Windows, open `kvr-gui.exe` directly from Explorer. Rebuilt GUI binaries
 use the Windows GUI subsystem; the CLI intentionally retains its console.
-Version 0.1.2 contains the source repair; the existing v0.1.1 download is unchanged.
+The Windows launch/capture repair was introduced in 0.1.2; 0.1.3 adds direct
+downloads and native application icons. Existing releases remain unchanged.
 
 The native window provides:
 
@@ -253,37 +271,45 @@ and for verifying recordings; the app itself does not need them.
 
 Releases are produced by [`.github/workflows/release.yml`](.github/workflows/release.yml);
 checks run on every push and PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-The table above shows the exact archive names for the current package version,
-`v0.1.2`.
+The table above lists the exact download names for the current package version,
+`v0.1.3`.
 
 Each archive has a single root directory
-(`kvr-v0.1.2-linux-x86_64` / `kvr-v0.1.2-windows-x86_64`)
+(`kvr-v0.1.3-linux-x86_64` / `kvr-v0.1.3-windows-x86_64`)
 containing the two binaries plus `README.md`, `LICENSE`,
 `THIRD_PARTY_NOTICES.md`, the three font `*-OFL.txt` notices, and
 `assets/pixel-art-logo.png` so the packaged README logo resolves — not the
 full repository source.
 
-Checksums are published alongside: a `<archive>.sha256` sidecar for each archive plus a combined `SHA256SUMS`. Verify a download with:
+Every archive, AppImage and standalone EXE has a `<filename>.sha256` sidecar; the combined `SHA256SUMS` covers all five binary downloads. Verify a download with:
 
 ```bash
 # Linux
-sha256sum -c kvr-v0.1.2-linux-x86_64.tar.gz.sha256
+sha256sum -c kvr-gui-v0.1.3-linux-x86_64.AppImage.sha256
 ```
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\kvr-v0.1.2-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\kvr-gui-v0.1.3-windows-x86_64.exe -Algorithm SHA256
 # compare against the value in the .sha256 sidecar / SHA256SUMS
 ```
 
-Packaging is done by `scripts/package-release.sh` (Linux) and
-`scripts/package-release.ps1` (Windows), which enforce the version match
-against `Cargo.toml`, the archive layout, and checksum verification:
+Packaging uses `scripts/package-release.sh` (Linux archive),
+`scripts/package-appimage.sh` (Linux GUI AppImage) and
+`scripts/package-release.ps1` (Windows ZIP + direct EXEs). They enforce version,
+architecture, packaged metadata and checksum checks without overwriting assets:
 
 ```bash
-bash scripts/package-release.sh v0.1.2 --bin-dir target/release --output-dir dist
-pwsh scripts/package-release.ps1 v0.1.2 -BinDir target/release -OutputDir dist
+bash scripts/package-release.sh v0.1.3 --bin-dir target/release --output-dir dist
+bash scripts/package-appimage.sh v0.1.3 --bin-dir target/release --output-dir dist
+pwsh scripts/package-release.ps1 v0.1.3 -BinDir target/release -OutputDir dist
 ```
+
+AppImage packaging needs Python Pillow (`python3-pil` on Ubuntu), `curl` and the
+native build dependencies. It verifies pinned linuxdeploy/GTK-plugin downloads,
+bundles GTK libraries/schemas/plugins and font notices, then extracts the image
+to validate desktop identity and logo pixels. CI runs the actual image under
+Xvfb/Mesa and checks its OS-facing icon and `WM_CLASS`, not just file existence.
 
 **Automatic releases from `main`.** Pushing to `main` publishes the Cargo package
 version if no GitHub release exists for it. Both Linux and Windows
@@ -355,7 +381,10 @@ runner with the MSVC + Windows SDK toolchain (Visual Studio Build Tools,
 refuses to overwrite an existing archive, checks x86-64 PE32+ headers and
 requires GUI Subsystem 2 / CLI Subsystem 3, rejects Visual C++ runtime DLL
 imports, validates the single-root ZIP, and writes a SHA-256 sidecar.
-The extracted ZIP binaries receive the same PE and runtime-import checks.
+Source, extracted and standalone binaries must have native ICON/GROUP_ICON
+payloads matching the original-logo ICO. Native Windows packaging also verifies
+the Windows shell-extracted icon pixels using `System.Drawing`, rather than
+comparing differently encoded PNG files.
 Dependency inspection uses `dumpbin` on Windows or `objdump` on Linux;
 portable header inspection uses Python 3:
 
@@ -374,12 +403,12 @@ are not runnable artifacts.
 To verify the archive on a Windows machine:
 
 ```powershell
-Expand-Archive .\kvr-v0.1.2-windows-x86_64.zip
-.\kvr-v0.1.2-windows-x86_64\kvr.exe --version
-Get-FileHash .\kvr-v0.1.2-windows-x86_64.zip -Algorithm SHA256
+Expand-Archive .\kvr-v0.1.3-windows-x86_64.zip
+.\kvr-v0.1.3-windows-x86_64\kvr.exe --version
+Get-FileHash .\kvr-gui-v0.1.3-windows-x86_64.exe -Algorithm SHA256
 ```
 
-The expected `kvr --version` output is `kvr 0.1.2` and the hash
+The expected `kvr --version` output is `kvr 0.1.3` and the hash
 must match the value in the sidecar / `SHA256SUMS`.
 
 </details>

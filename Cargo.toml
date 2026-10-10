@@ -1,6 +1,6 @@
 [package]
 name = "kagantic-voice-recorder"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Native audio recorder that captures microphone input and writes Opus / WAV / raw PCM."
 license = "AGPL-3.0-or-later"
@@ -53,6 +53,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 3

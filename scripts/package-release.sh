@@ -22,7 +22,7 @@
 #
 # Usage (relative paths are resolved against the repository root):
 #
-#   bash scripts/package-release.sh v0.1.2 --bin-dir target/release --output-dir dist
+#   bash scripts/package-release.sh v0.1.3 --bin-dir target/release --output-dir dist
 #
 # The version (with or without a leading `v`) must equal the Cargo package
 # version. Binaries are validated as ELF x86-64 before packaging, and the
@@ -38,7 +38,7 @@ usage() {
 Usage: package-release.sh <VERSION> [--bin-dir DIR] [--output-dir DIR]
 
   VERSION         Release version with an optional `v` prefix (for example
-                  `v0.1.2`). Must equal the Cargo package version.
+                  `v0.1.3`). Must equal the Cargo package version.
   --bin-dir DIR   Directory containing the release binaries
                   (default: target/release).
   --output-dir DIR
