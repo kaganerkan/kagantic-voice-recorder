@@ -150,7 +150,11 @@ ffmpeg -i recording.opus -f wav out.wav
   native Windows additionally compares shell-extracted icon pixels to the PNG.
   AppImage packaging uses pinned linuxdeploy/GTK tooling, bundles native dialog
   dependencies, schemas, icons and notices, and validates the extracted image.
-  It requires Pillow (`python3-pil` on Ubuntu). `scripts/check-linux-gui.py`
+  It explicitly bundles ALSA and XKB (including the X11 library loaded by winit
+  via `dlopen`); these cannot be left to automatic ELF dependency discovery.
+  It requires Pillow (`python3-pil` on Ubuntu), `pkg-config`, and the ALSA,
+  GTK3 and XKB development packages (`libxkbcommon-x11-dev` on Ubuntu,
+  `libxkbcommon-x11-devel` on Fedora). `scripts/check-linux-gui.py`
   runs the actual AppImage under Xvfb/Mesa and checks `WM_CLASS` and `_NET_WM_ICON`
   pixels; CI needs `xvfb`, `x11-utils`, `imagemagick` and `libgl1-mesa-dri`.
   Keep `.cargo/config.toml` and `.cargo/msvc-runtime.cmake` enabled: Rust and

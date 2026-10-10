@@ -26,10 +26,17 @@ done
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || fail 'Linux x86_64 required'
 case "$BIN_DIR" in /*) ;; *) BIN_DIR="$ROOT_DIR/$BIN_DIR" ;; esac
 case "$OUTPUT_DIR" in /*) ;; *) OUTPUT_DIR="$ROOT_DIR/$OUTPUT_DIR" ;; esac
-for command in cargo python3 curl sha256sum file; do
+for command in cargo python3 curl sha256sum file pkg-config; do
   command -v "$command" >/dev/null || fail "required command not found: $command"
 done
 python3 -c 'from PIL import Image' || fail 'Pillow is required (Ubuntu: python3-pil)'
+# Winit loads XKB via dlopen; it is invisible to ELF dependency discovery.
+XKB_LIBRARY="$(pkg-config --variable=libdir xkbcommon)/libxkbcommon.so.0"
+XKB_X11_LIBRARY="$(pkg-config --variable=libdir xkbcommon-x11)/libxkbcommon-x11.so.0"
+ALSA_LIBRARY="$(pkg-config --variable=libdir alsa)/libasound.so.2"
+for library in "$XKB_LIBRARY" "$XKB_X11_LIBRARY" "$ALSA_LIBRARY"; do
+  [ -f "$library" ] || fail "required native runtime library not found: $library"
+done
 CARGO_VERSION="$(cd "$ROOT_DIR" && cargo metadata --locked --no-deps --format-version 1 | python3 -c '
 import json, os, sys
 meta = json.load(sys.stdin)
@@ -108,6 +115,7 @@ OUTPUT="$STAGING/$NAME"
 export OUTPUT
 (cd "$STAGING" && "$LINUXDEPLOY" --appdir "$APPDIR" \
   --executable "$BIN_DIR/kvr-gui" --executable "$BIN_DIR/kvr" \
+  --library "$XKB_LIBRARY" --library "$XKB_X11_LIBRARY" --library "$ALSA_LIBRARY" \
   --desktop-file "$DESKTOP" --icon-file "$APPDIR/kagantic-voice-recorder.png" \
   --plugin gtk)
 python3 "$ROOT_DIR/scripts/collect-appimage-notices.py" "$APPDIR"
@@ -137,6 +145,8 @@ for path in [root / '.DirIcon', root / 'kagantic-voice-recorder.png'] + [
     assert image.size in [(s, s) for s in (32, 64, 128, 256)], (path, image.size)
     assert image.tobytes() == original.resize(image.size, nearest).tobytes(), path
 assert list(root.glob('usr/lib/libgtk-3.so*')), 'GTK3 not bundled'
+for library in ('libxkbcommon.so.0', 'libxkbcommon-x11.so.0', 'libasound.so.2'):
+    assert (root / 'usr/lib' / library).is_file(), f'native runtime not bundled: {library}'
 assert list(root.glob('usr/share/glib-2.0/schemas/gschemas.compiled')), 'GLib schemas not bundled'
 for notice in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'assets/fonts/Silkscreen-OFL.txt', 'assets/fonts/VT323-OFL.txt', 'assets/fonts/DotGothic16-OFL.txt'):
     assert (root / notice).is_file(), notice
