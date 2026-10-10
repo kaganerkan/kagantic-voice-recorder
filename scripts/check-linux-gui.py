@@ -145,8 +145,13 @@ def main():
                     if args.screenshot.exists():
                         raise FileExistsError("Refusing to overwrite screenshot: " + str(args.screenshot))
                     time.sleep(1)
-                    subprocess.run(["import", "-display", env["DISPLAY"], "-window", window,
-                                    str(args.screenshot.resolve())], check=True, env=env)
+                    try:
+                        run(["import", "-display", env["DISPLAY"], "-window", window,
+                             str(args.screenshot.resolve())], env)
+                    except subprocess.CalledProcessError as error:
+                        raise RuntimeError("GUI screenshot failed: " + (error.output or "")
+                                           + "\nGUI log:\n"
+                                           + (root / "gui.log").read_text(errors="replace")) from error
                 if app.poll() is not None:
                     raise RuntimeError("GUI exited during icon inspection")
                 print("Actual AppImage GUI rendered; WM_CLASS and 32x32 OS icon match the original logo")
